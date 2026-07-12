@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "triage"
+version = "0.1.0"
+description = "Local-first engine for deciding what humans should review when review capacity is limited"
+requires-python = ">=3.12"
+authors = [
+    {name = "jope", email = "jope.arizag@gmail.com"}
+]
+dependencies = [
+    "polars",
+    "pyarrow",
+    "scikit-learn",
+    "pydantic>=2",
+    "typer",
+    "jinja2",
+    "plotly",
+    "pyyaml",
+    "numpy",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "hypothesis",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+triage = "triage.cli:app_main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["triage"]
+
+[tool.mypy]
+strict = true
+files = "src/triage"
+python_version = "3.12"
+
+[[tool.mypy.overrides]]
+module = ["sklearn.*", "plotly.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
