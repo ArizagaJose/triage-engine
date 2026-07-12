@@ -1,0 +1,100 @@
+# CLAUDE.md
+ 
+Working name: **triage** (CLI: `triage`). Repo name TBD.
+ 
+A local-first engine that decides *what humans should review* when review capacity
+is limited. Takes AI-scored predictions + a declarative cost model + a review
+budget, and outputs a deterministic, versioned routing policy that maximizes
+expected risk captured per review.
+ 
+Read `GOAL.md` first for the full spec, phases, and design decisions. This file
+covers how to work on the codebase.
+ 
+## Stack
+ 
+- Python 3.12+, managed with `uv`
+- **polars** for dataframes, **pyarrow** for Parquet IO
+- **scikit-learn** ONLY for calibration (isotonic / Platt). No other ML.
+- **pydantic v2** for config and data contracts
+- **typer** for the CLI
+- **jinja2 + plotly** for the HTML report
+- **pytest** (+ hypothesis for property tests), **ruff** (lint + format), **mypy**
+## Commands
+ 
+```bash
+uv sync                      # install deps
+uv run pytest                # run tests
+uv run pytest -k determinism # the tests that matter most
+uv run ruff check . && uv run ruff format --check .
+uv run mypy src/
+ 
+# CLI (see GOAL.md for full spec)
+uv run triage calibrate --golden data/golden.parquet -o artifacts/calibrator.json
+uv run triage plan --batch data/batch.parquet --costs costs.yaml --budget 0.10 -o artifacts/policy.json
+uv run triage backtest --policy artifacts/policy.json --history data/history.parquet
+uv run triage report -o report.html
+```
+ 
+## Layout
+ 
+```
+src/triage/
+  contract.py     # input schema validation (strict, fail-fast)
+  calibration.py  # isotonic + Platt, ECE, bootstrap CIs, calibrator artifact
+  costs.py        # YAML cost model, pydantic validation
+  optimizer.py    # expected loss + greedy budget allocation -> policy
+  backtest.py     # replay policy vs baselines on labeled history
+  report.py       # HTML report (jinja2 + plotly)
+  synth.py        # synthetic data generator (seeded scenarios)
+  cli.py          # typer app, exit codes
+tests/
+docs/
+```
+ 
+## Invariants — do not break these
+ 
+1. **Determinism is the product.** Same inputs → semantically identical
+   `policy.json`, always. Fixed seeds everywhere (seeds are explicit CLI/config
+   params, never implicit). Stable sorts with `item_id` as final tie-breaker.
+   JSON artifacts written with sorted keys.
+2. **Artifacts are self-describing.** Every artifact (calibrator, policy,
+   backtest result) embeds: sha256 of its inputs, tool version, and the config
+   used. `policy_hash` is computed over semantic content only (timestamp
+   excluded), so two runs on the same inputs produce the same hash.
+3. **Exit codes are a public API** (CI gates depend on them):
+   - `0` OK
+   - `1` input contract violation
+   - `2` residual risk above the threshold declared in the cost YAML
+   - `3` calibration quality below declared minimum (ECE gate)
+   - `4` internal error
+   Never change these meanings; add new codes only in GOAL.md first.
+4. **Domain-agnostic.** `segment` is an opaque string. No healthcare, finance,
+   or any domain-specific logic anywhere. No references to any employer's work.
+5. **Local-first.** No network calls, no services, no databases, no telemetry.
+6. **No ML creep.** If a solution needs more than isotonic/Platt from sklearn,
+   it is out of scope — flag it instead of building it.
+## Style
+ 
+- English for all code, comments, docs, commit messages.
+- Type hints everywhere. Pydantic models at IO boundaries, plain
+  dataclasses/functions inside.
+- Small pure functions for the math; IO only at the edges (`cli.py`, readers/writers).
+- Errors: raise typed exceptions internally; `cli.py` maps them to exit codes
+  and human-readable messages. Never `sys.exit()` outside `cli.py`.
+## Testing priorities (in order)
+ 
+1. **Determinism property tests**: run twice, compare artifacts byte-for-byte
+   (minus timestamp field).
+2. **Math unit tests**: ECE computation, expected loss, greedy allocation
+   (including budget edge cases: 0%, 100%, budget larger than batch).
+3. **Contract tests**: malformed inputs fail with exit code 1 and a clear message.
+4. **Golden-file test**: a seeded synthetic scenario with a committed expected
+   `policy.json`.
+5. **Claim verification**: the synthetic scenarios in `synth.py` have known
+   injected error rates — tests assert the backtester's captured-risk numbers
+   match the analytically expected values within tolerance.
+## Scope guard
+ 
+- MVP first (see phases in GOAL.md). Do NOT implement the grouped/knapsack
+  routing (v2) unless explicitly asked.
+- When in doubt between "clever" and "auditable", pick auditable.
