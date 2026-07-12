@@ -3,7 +3,10 @@
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+import yaml
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+
+from triage.exceptions import ContractViolation
 
 
 class Budget(BaseModel):
@@ -92,7 +95,13 @@ class CostModel(BaseModel):
 
     def costs_for(self, segment: str) -> SegmentCosts:
         """Get costs for segment: exact key, else 'default', else raise ContractViolation."""
-        raise NotImplementedError
+        if segment in self.segments:
+            return self.segments[segment]
+        if "default" in self.segments:
+            return self.segments["default"]
+        raise ContractViolation(
+            f"Segment '{segment}' not found in cost model and no 'default' segment defined"
+        )
 
 
 def load(path: Path) -> CostModel:
@@ -101,4 +110,36 @@ def load(path: Path) -> CostModel:
     YAML parse errors and pydantic ValidationErrors are wrapped into
     ContractViolation with a readable message.
     """
-    raise NotImplementedError
+    # Try to read the file
+    try:
+        content = path.read_text()
+    except FileNotFoundError as e:
+        raise ContractViolation(f"Cost model file not found: {path}") from e
+    except (OSError, IOError) as e:
+        raise ContractViolation(f"Cannot read cost model file {path}: {e}") from e
+
+    # Try to parse YAML
+    try:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError as e:
+        raise ContractViolation(f"Invalid YAML in cost model file {path}: {e}") from e
+
+    # Check that the top level is a dict
+    if not isinstance(data, dict):
+        raise ContractViolation(
+            f"Cost model file {path} must contain a YAML dictionary (object) at top level, "
+            f"got {type(data).__name__}"
+        )
+
+    # Try to validate into CostModel
+    try:
+        return CostModel(**data)
+    except ValidationError as e:
+        # Format validation errors in a readable way
+        error_lines = []
+        for error in e.errors():
+            loc = " -> ".join(str(x) for x in error["loc"])
+            msg = error["msg"]
+            error_lines.append(f"  {loc}: {msg}")
+        error_summary = "\n".join(error_lines)
+        raise ContractViolation(f"Cost model validation failed for {path}:\n{error_summary}") from e
