@@ -143,8 +143,12 @@ def plan(
             "p_error_threshold": threshold,
         }
 
-    total_captured = math.fsum(float(expected_loss[i]) for i in range(n_batch) if routed[i])
-    total_residual = math.fsum(float(expected_loss[i]) for i in range(n_batch) if not routed[i])
+    # Totals are defined as the plain sequential sum of the per-segment values
+    # in sorted-segment order (not an independent fsum over the interleaved
+    # batch): the accounting table in policy.json must tie out exactly, and
+    # separately-computed float sums differ at ULP level.
+    total_captured = sum(s["expected_captured_loss"] for s in segment_stats.values())
+    total_residual = sum(s["expected_residual_loss"] for s in segment_stats.values())
     total_review_spend = math.fsum(float(review_costs[i]) for i in range(n_batch) if routed[i])
     totals = {
         "expected_captured_loss": total_captured,

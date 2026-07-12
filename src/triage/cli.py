@@ -107,7 +107,10 @@ def plan(
 
     input_sha256s = {
         "batch": artifacts.file_sha256(batch),
-        "calibrator": artifacts.file_sha256(calibrator),
+        # Semantic hash, not file bytes: the calibrator artifact embeds its own
+        # created_at, so hashing bytes would make policy_hash depend on WHEN the
+        # calibrator was fitted rather than on what it computes.
+        "calibrator": artifacts.content_hash(calibrator_dict),
         "costs": artifacts.file_sha256(costs),
     }
     policy = optimizer.plan(

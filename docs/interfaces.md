@@ -205,7 +205,9 @@ Pinned semantics (do not improvise):
    `p_error >= p_error_threshold`.
 8. `expected_captured_loss` = Σ expected_loss over routed items;
    `expected_residual_loss` = Σ expected_loss over non-routed items. Both per
-   segment and total.
+   segment and total. Per-segment values use `math.fsum`; the TOTALS are
+   defined as the plain sequential sum of the per-segment values in sorted
+   segment order, so the accounting table in policy.json ties out exactly.
 9. Residual gate is checked by a separate helper
    `check_residual_gate(policy, cost_model) -> None` raising
    `ResidualRiskExceeded` (the CLI writes `policy.json` FIRST, then checks the
@@ -297,6 +299,12 @@ triage plan --batch data/batch.parquet --calibrator artifacts/calibrator.json \
   artifact is written first.
 - `plan` gating order: write policy.json, then `check_ece_gate` against
   `gates.max_ece` from the YAML (exit 3), then `check_residual_gate` (exit 2).
+- `plan`'s `input_sha256s`: `batch` and `costs` are `file_sha256` of raw
+  bytes; `calibrator` is `content_hash` of the PARSED artifact dict
+  (semantic hash, `created_at` excluded). The calibrator file embeds its own
+  timestamp, so hashing bytes would make `policy_hash` depend on when the
+  calibrator was fitted rather than on what it computes, breaking golden-file
+  reproducibility across independent end-to-end runs.
 - Exit-code mapping in ONE place (a `main`-level try/except):
   `ContractViolation → 1`, `ResidualRiskExceeded → 2`,
   `CalibrationGateFailed → 3`, other `Exception → 4` (message to stderr,
