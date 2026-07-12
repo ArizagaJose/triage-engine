@@ -175,9 +175,14 @@ included with `count: 0` and nulls for means).
 class Policy:
     ...  # mirrors policy.json content, see §7
 
-def plan(batch: pl.DataFrame, calibrator: Calibrator, cost_model: CostModel,
+def plan(batch: pl.DataFrame, calibrator: PredictsErrors, cost_model: CostModel,
          *, input_sha256s: dict[str, str], tool_version: str) -> Policy
 ```
+
+`PredictsErrors` is a small structural Protocol defined in `optimizer.py`
+(`def predict(self, scores: np.ndarray) -> np.ndarray`); the real `Calibrator`
+satisfies it. This keeps optimizer tests independent of the calibration
+implementation.
 
 Pinned semantics (do not improvise):
 
@@ -187,8 +192,11 @@ Pinned semantics (do not improvise):
 4. Sort by `net_benefit` DESC, tie-break `item_id` ASC (single stable sort).
 5. Budget in review units:
    - `fraction` → `floor(value * n_batch)` items;
-   - `count` → `int(value)` items;
-   - `money` → walk the sorted list, admit while cumulative `review_cost <= value`.
+   - `count` → `int(value)` items (capped at `n_batch`);
+   - `money` → walk the sorted list, admit while cumulative
+     `review_cost <= value`; stop at the FIRST item that does not fit (no
+     skip-and-continue — keeping the review set a prefix of the ranking is
+     what makes per-segment thresholds exact).
 6. Route to review while budget remains **and** `net_benefit > 0` (items with
    non-positive net benefit are never routed, even under unspent budget).
 7. Per-segment `p_error_threshold` = min `p_error` among routed items of that
