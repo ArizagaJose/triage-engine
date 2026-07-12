@@ -1,14 +1,21 @@
 """CLI entry point and command definitions."""
 
+import json
 import sys
 import traceback
 from pathlib import Path
 
 import typer
+from pydantic import ValidationError
 
 # typer >= 0.26 vendors click; usage errors are raised as these classes.
 from typer._click.exceptions import ClickException
 
+from triage import __version__, artifacts, calibration, contract, optimizer
+from triage import costs as costs_module
+from triage import synth as synth_module
+from triage.calibration import Calibrator
+from triage.costs import Budget
 from triage.exceptions import CalibrationGateFailed, ContractViolation, ResidualRiskExceeded
 
 app = typer.Typer()
@@ -26,7 +33,8 @@ def synth(
     ),
 ) -> None:
     """Generate synthetic test data."""
-    raise NotImplementedError
+    synth_module.write(scenario, seed=seed, out_dir=out_dir)
+    typer.echo(f"Wrote scenario={scenario!r} seed={seed} to {out_dir}")
 
 
 @app.command()
@@ -42,7 +50,21 @@ def calibrate(
     ),
 ) -> None:
     """Calibrate model predictions on golden set."""
-    raise NotImplementedError
+    df = contract.read_input(golden, require_truth=True)
+    input_sha = artifacts.file_sha256(golden)
+    cal = calibration.fit(df, seed=seed, input_sha256=input_sha)
+
+    artifact_dict = cal.to_dict()
+    artifact_dict["created_at"] = artifacts.utc_now_iso()
+    artifacts.write_artifact(artifact_dict, output)
+
+    if max_ece is not None:
+        calibration.check_ece_gate(cal, max_ece)
+
+    typer.echo(
+        f"method={cal.method} ece_holdout={cal.ece_holdout:.4f} "
+        f"ece_ci=({cal.ece_ci[0]:.4f}, {cal.ece_ci[1]:.4f}) -> {output}"
+    )
 
 
 @app.command()
@@ -59,7 +81,54 @@ def plan(
     ),
 ) -> None:
     """Plan routing policy given calibrator and costs."""
-    raise NotImplementedError
+    batch_df = contract.read_input(batch)
+
+    try:
+        calibrator_text = calibrator.read_text()
+    except OSError as e:
+        raise ContractViolation(f"Cannot read calibrator file {calibrator}: {e}") from e
+    try:
+        calibrator_dict = json.loads(calibrator_text)
+    except json.JSONDecodeError as e:
+        raise ContractViolation(f"Calibrator file {calibrator} is not valid JSON: {e}") from e
+    try:
+        cal = Calibrator.from_dict(calibrator_dict)
+    except KeyError as e:
+        raise ContractViolation(f"Calibrator file {calibrator} is missing key {e}") from e
+
+    cost_model = costs_module.load(costs)
+
+    if budget is not None:
+        try:
+            new_budget = Budget(type=cost_model.budget.type, value=budget)
+        except ValidationError as e:
+            raise ContractViolation(f"Invalid --budget override {budget!r}: {e}") from e
+        cost_model = cost_model.model_copy(update={"budget": new_budget})
+
+    input_sha256s = {
+        "batch": artifacts.file_sha256(batch),
+        "calibrator": artifacts.file_sha256(calibrator),
+        "costs": artifacts.file_sha256(costs),
+    }
+    policy = optimizer.plan(
+        batch_df, cal, cost_model, input_sha256s=input_sha256s, tool_version=__version__
+    )
+
+    artifact_dict = policy.to_dict()
+    artifact_dict["created_at"] = artifacts.utc_now_iso()
+    artifacts.write_artifact(artifact_dict, output)
+
+    if cost_model.gates.max_ece is not None:
+        calibration.check_ece_gate(cal, cost_model.gates.max_ece)
+    optimizer.check_residual_gate(policy, cost_model)
+
+    totals = policy.totals
+    typer.echo(
+        f"n_review={totals['n_review']}/{totals['n_total']} "
+        f"captured={totals['expected_captured_loss']:.1f} "
+        f"residual={totals['expected_residual_loss']:.1f} "
+        f"policy_hash={policy.policy_hash[:12]} -> {output}"
+    )
 
 
 def app_main() -> None:

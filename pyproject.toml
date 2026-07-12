@@ -28,6 +28,7 @@ dev = [
     "hypothesis",
     "ruff",
     "mypy",
+    "kaleido",
 ]
 
 [project.scripts]
