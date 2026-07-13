@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>triage report</title>
+<style>
+  :root {
+    --ink: #333333;
+    --policy: #2a78d6;
+    --raw: #1baf7a;
+    --random: #eda100;
+    --bg: #fcfcfb;
+    --grid: #e6e6e3;
+    --border: #dddddd;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: Arial, Helvetica, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+    margin: 0;
+    padding: 0 0 3rem 0;
+  }
+  main {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 1.5rem;
+  }
+  h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.5rem; border-bottom: 1px solid var(--border); padding-bottom: 0.25rem; }
+  h3 { font-size: 1.05rem; margin-top: 1.5rem; }
+  .meta { color: #666666; font-size: 0.9rem; margin: 0.1rem 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 0.75rem 0 1.25rem 0;
+    font-size: 0.9rem;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 0.35rem 0.6rem;
+    text-align: right;
+  }
+  th, td:first-child { text-align: left; }
+  th { background: #f2f2f0; }
+  code.hash {
+    font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+    font-size: 0.8rem;
+    word-break: break-all;
+  }
+  .note {
+    background: #fff6e0;
+    border: 1px solid #eda100;
+    padding: 0.75rem 1rem;
+    border-radius: 4px;
+  }
+  .figure-wrap { margin: 1rem 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>triage report</h1>
+  <p class="meta">tool_version: {{ tool_version }}</p>
+  <p id="created-at" class="meta">{{ created_at }}</p>
+
+  <h2>Artifact hash chain</h2>
+  <table>
+    <tr><th>artifact</th><th>hash</th></tr>
+    {% for label, value in hash_rows %}
+    <tr><td>{{ label }}</td><td><code class="hash">{{ value }}</code></td></tr>
+    {% endfor %}
+  </table>
+
+  <h2>Calibration</h2>
+  <p class="meta">method: {{ calibration.method }} &middot; n_golden: {{ calibration.n_golden }} &middot; seed: {{ calibration.seed }}</p>
+  <table>
+    <tr><th>metric</th><th>raw score</th><th>calibrated</th></tr>
+    <tr>
+      <td>ECE (holdout)</td>
+      <td>{{ "%.4f"|format(calibration.ece_raw_holdout) }}</td>
+      <td>{{ "%.4f"|format(calibration.ece_holdout) }} (95% CI [{{ "%.4f"|format(calibration.ece_ci[0]) }}, {{ "%.4f"|format(calibration.ece_ci[1]) }}])</td>
+    </tr>
+  </table>
+  <div class="figure-wrap">{{ figs["fig-reliability"] | safe }}</div>
+
+  <h2>Policy summary</h2>
+  <p class="meta">budget: {{ policy.budget.type }} = {{ policy.budget.value }}</p>
+  <table>
+    <tr><th>scope</th><th>n_review</th><th>n_total</th><th>expected captured loss</th><th>expected residual loss</th></tr>
+    <tr>
+      <td>total</td>
+      <td>{{ policy.totals.n_review }}</td>
+      <td>{{ policy.totals.n_total }}</td>
+      <td>{{ "%.2f"|format(policy.totals.expected_captured_loss) }}</td>
+      <td>{{ "%.2f"|format(policy.totals.expected_residual_loss) }}</td>
+    </tr>
+  </table>
+
+  <h3>Per-segment</h3>
+  <table>
+    <tr><th>segment</th><th>p_error threshold</th><th>n_review</th><th>n_total</th><th>expected captured loss</th><th>expected residual loss</th></tr>
+    {% for name, stats in policy.segments %}
+    <tr>
+      <td>{{ name }}</td>
+      <td>{% if stats.p_error_threshold is none %}&mdash;{% else %}{{ "%.4f"|format(stats.p_error_threshold) }}{% endif %}</td>
+      <td>{{ stats.n_review }}</td>
+      <td>{{ stats.n_total }}</td>
+      <td>{{ "%.2f"|format(stats.expected_captured_loss) }}</td>
+      <td>{{ "%.2f"|format(stats.expected_residual_loss) }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <h2>Backtest</h2>
+  {% if backtest %}
+  <p class="meta">
+    n_history: {{ backtest.n_history }} &middot; n_errors: {{ backtest.n_errors }} &middot;
+    total_true_loss: {{ "%.2f"|format(backtest.total_true_loss) }}
+  </p>
+  <p>
+    Expected residual loss (from the plan): <strong>{{ "%.2f"|format(backtest.expected.expected_residual_loss) }}</strong>
+    &nbsp;vs.&nbsp;
+    realized residual loss (replayed on history): <strong>{{ "%.2f"|format(backtest.realized_residual_loss) }}</strong>
+    (gap: {{ "%.2f"|format(backtest.residual_gap) }})
+  </p>
+
+  <table>
+    <tr><th>strategy</th><th>captured loss</th><th>residual loss</th><th>n_review</th><th>efficiency</th><th>capture_rate</th></tr>
+    <tr>
+      <td>policy</td>
+      <td>{{ "%.2f"|format(backtest.strategies.policy.captured_loss) }}</td>
+      <td>{{ "%.2f"|format(backtest.strategies.policy.residual_loss) }}</td>
+      <td>{{ backtest.strategies.policy.n_review }}</td>
+      <td>{% if backtest.strategies.policy.efficiency is none %}&mdash;{% else %}{{ "%.2f"|format(backtest.strategies.policy.efficiency) }}{% endif %}</td>
+      <td>{% if backtest.strategies.policy.capture_rate is none %}&mdash;{% else %}{{ "%.4f"|format(backtest.strategies.policy.capture_rate) }}{% endif %}</td>
+    </tr>
+    <tr>
+      <td>raw confidence</td>
+      <td>{{ "%.2f"|format(backtest.strategies.raw_confidence.captured_loss) }}</td>
+      <td>{{ "%.2f"|format(backtest.strategies.raw_confidence.residual_loss) }}</td>
+      <td>{{ backtest.strategies.raw_confidence.n_review }}</td>
+      <td>{% if backtest.strategies.raw_confidence.efficiency is none %}&mdash;{% else %}{{ "%.2f"|format(backtest.strategies.raw_confidence.efficiency) }}{% endif %}</td>
+      <td>{% if backtest.strategies.raw_confidence.capture_rate is none %}&mdash;{% else %}{{ "%.4f"|format(backtest.strategies.raw_confidence.capture_rate) }}{% endif %}</td>
+    </tr>
+    <tr>
+      <td>random (mean &plusmn; std)</td>
+      <td>{{ "%.2f"|format(backtest.strategies.random.captured_loss_mean) }} &plusmn; {{ "%.2f"|format(backtest.strategies.random.captured_loss_std) }}</td>
+      <td>{{ "%.2f"|format(backtest.strategies.random.residual_loss_mean) }}</td>
+      <td>{{ backtest.strategies.random.n_review }}</td>
+      <td>{% if backtest.strategies.random.efficiency is none %}&mdash;{% else %}{{ "%.2f"|format(backtest.strategies.random.efficiency) }}{% endif %}</td>
+      <td>{% if backtest.strategies.random.capture_rate is none %}&mdash;{% else %}{{ "%.4f"|format(backtest.strategies.random.capture_rate) }}{% endif %}</td>
+    </tr>
+  </table>
+  <p class="meta">All three strategies review exactly {{ backtest.n_review }} item(s) at this capacity, so differences in captured loss reflect ranking quality alone.</p>
+  <div class="figure-wrap">{{ figs["fig-backtest"] | safe }}</div>
+
+  <h2>Coverage vs. risk</h2>
+  <p class="meta">Vertical marker at the policy's own review capacity ({{ "%.2f"|format(budget_fraction * 100) }}% of history).</p>
+  <div class="figure-wrap">{{ figs["fig-coverage"] | safe }}</div>
+  {% else %}
+  <p class="note">Backtest not run: this report reflects the plan-only pipeline (calibrator + policy).
+  Run <code>triage backtest</code> and re-run <code>triage report</code> to add realized-outcome
+  comparisons and coverage-vs-risk curves.</p>
+  {% endif %}
+</main>
+</body>
+</html>

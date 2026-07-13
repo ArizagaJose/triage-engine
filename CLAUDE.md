@@ -31,8 +31,9 @@ uv run mypy src/
 # CLI (see GOAL.md for full spec)
 uv run triage calibrate --golden data/golden.parquet -o artifacts/calibrator.json
 uv run triage plan --batch data/batch.parquet --costs costs.yaml --budget 0.10 -o artifacts/policy.json
-uv run triage backtest --policy artifacts/policy.json --history data/history.parquet
-uv run triage report -o report.html
+uv run triage backtest --policy artifacts/policy.json --calibrator artifacts/calibrator.json \
+                       --history data/history.parquet -o artifacts/backtest.json
+uv run triage report --from artifacts -o report.html
 ```
  
 ## Layout

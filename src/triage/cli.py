@@ -4,6 +4,7 @@ import json
 import sys
 import traceback
 from pathlib import Path
+from typing import Any
 
 import typer
 from pydantic import ValidationError
@@ -14,6 +15,7 @@ from typer._click.exceptions import ClickException
 from triage import __version__, artifacts, calibration, contract, optimizer
 from triage import backtest as backtest_module
 from triage import costs as costs_module
+from triage import report as report_module
 from triage import synth as synth_module
 from triage.calibration import Calibrator
 from triage.costs import Budget, CostModel
@@ -219,6 +221,71 @@ def backtest(
         f"residual={policy_strategy['residual_loss']:.1f} "
         f"backtest_hash={result.backtest_hash[:12]} -> {output}"
     )
+
+
+@app.command()
+def report(
+    from_dir: Path = typer.Option(
+        ...,
+        "--from",
+        help="Directory containing calibrator.json and policy.json (backtest.json optional)",
+    ),
+    output: Path = typer.Option(
+        ...,
+        "--output",
+        "-o",
+        help="Output path for report.html",
+    ),
+) -> None:
+    """Render a self-contained HTML report from artifacts in a directory."""
+    calibrator_path = from_dir / "calibrator.json"
+    policy_path = from_dir / "policy.json"
+    backtest_path = from_dir / "backtest.json"
+
+    try:
+        calibrator_text = calibrator_path.read_text()
+    except OSError as e:
+        raise ContractViolation(f"Cannot read calibrator file {calibrator_path}: {e}") from e
+    try:
+        calibrator_dict = json.loads(calibrator_text)
+    except json.JSONDecodeError as e:
+        raise ContractViolation(f"Calibrator file {calibrator_path} is not valid JSON: {e}") from e
+
+    try:
+        policy_text = policy_path.read_text()
+    except OSError as e:
+        raise ContractViolation(f"Cannot read policy file {policy_path}: {e}") from e
+    try:
+        policy_dict = json.loads(policy_text)
+    except json.JSONDecodeError as e:
+        raise ContractViolation(f"Policy file {policy_path} is not valid JSON: {e}") from e
+
+    backtest_dict: dict[str, Any] | None = None
+    if backtest_path.exists():
+        try:
+            backtest_text = backtest_path.read_text()
+        except OSError as e:
+            raise ContractViolation(f"Cannot read backtest file {backtest_path}: {e}") from e
+        try:
+            backtest_dict = json.loads(backtest_text)
+        except json.JSONDecodeError as e:
+            raise ContractViolation(f"Backtest file {backtest_path} is not valid JSON: {e}") from e
+
+    html = report_module.render(
+        calibrator_dict,
+        policy_dict,
+        backtest_dict,
+        created_at=artifacts.utc_now_iso(),
+        tool_version=__version__,
+    )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(html)
+
+    included = "calibrator+policy" + (
+        "+backtest" if backtest_dict is not None else " (no backtest)"
+    )
+    typer.echo(f"included={included} -> {output}")
 
 
 def app_main() -> None:

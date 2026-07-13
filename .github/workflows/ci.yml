@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Lint (ruff check)
+        run: uv run ruff check .
+
+      - name: Format check (ruff format)
+        run: uv run ruff format --check .
+
+      - name: Type check (mypy)
+        run: uv run mypy src/
+
+      - name: Test (pytest)
+        run: uv run pytest -q
+
+  gates:
+    runs-on: ubuntu-latest
+    needs: checks
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync
+
+      # Real exit-code demo: this is the repo's own CI, not just a test of
+      # one. The drift scenario is stale-by-design (docs/interfaces.md §6),
+      # so a downstream residual-risk gate is expected to trip in the
+      # `gates` step below, not here.
+      - name: synth drift
+        run: uv run triage synth --scenario drift --seed 42 -o data
+
+      - name: calibrate (max-ece gate 0.05)
+        run: |
+          uv run triage calibrate --golden data/golden.parquet --seed 42 \
+            --max-ece 0.05 -o artifacts/calibrator.json
+
+      - name: plan
+        run: |
+          uv run triage plan --batch data/batch.parquet \
+            --calibrator artifacts/calibrator.json --costs data/costs.yaml \
+            -o artifacts/policy.json
+
+      - name: backtest
+        run: |
+          uv run triage backtest --policy artifacts/policy.json \
+            --calibrator artifacts/calibrator.json --history data/batch.parquet \
+            -o artifacts/backtest.json
+
+      - name: report
+        run: uv run triage report --from artifacts -o report.html
+
+      # Exit-code gate demo (docs/interfaces.md §12): build a costs.yaml
+      # whose gates.max_residual_risk is 200000 from the emitted costs.yaml,
+      # then assert `plan` exits 0 and `backtest` exits 2 against it. The
+      # if/else idiom keeps this `set -e`-safe: a command tested as an `if`
+      # condition does not trip `set -e` on failure.
+      - name: exit-code gate demo (max_residual_risk=200000)
+        run: |
+          set -e
+          uv run python3 - <<'PY'
+          import yaml
+
+          with open("data/costs.yaml") as f:
+              cfg = yaml.safe_load(f)
+          cfg.setdefault("gates", {})["max_residual_risk"] = 200000
+          with open("gated_costs.yaml", "w") as f:
+              yaml.safe_dump(cfg, f)
+          PY
+
+          uv run triage plan --batch data/batch.parquet \
+            --calibrator artifacts/calibrator.json --costs gated_costs.yaml \
+            -o artifacts/gated_policy.json
+          echo "plan exited 0 as expected"
+
+          if uv run triage backtest --policy artifacts/gated_policy.json \
+            --calibrator artifacts/calibrator.json --history data/batch.parquet \
+            -o artifacts/gated_backtest.json; then
+            echo "expected backtest to exit 2 (residual risk gate), but it exited 0" >&2
+            exit 1
+          else
+            test $? -eq 2
+            echo "backtest exited 2 as expected"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: triage-artifacts
+          path: |
+            artifacts/
+            report.html

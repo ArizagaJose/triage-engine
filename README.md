@@ -29,7 +29,7 @@ of guessing.
 ```
 scored predictions ──┐
                       ├─▶ calibrate ─▶ calibrator.json ─┐
-golden (labeled) ─────┘                                 ├─▶ plan ─▶ policy.json ─▶ backtest (v1)
+golden (labeled) ─────┘                                 ├─▶ plan ─▶ policy.json ─▶ backtest ─▶ report
 cost model (YAML) ───────────────────────────────────────┘
 ```
 
@@ -55,6 +55,18 @@ uv run triage calibrate --golden data/golden.parquet --seed 42 -o artifacts/cali
 # Plan a routing policy against a review budget
 uv run triage plan --batch data/batch.parquet --calibrator artifacts/calibrator.json \
                     --costs data/costs.yaml --budget 0.10 -o artifacts/policy.json
+
+# Replay the policy on labeled history vs random and raw-confidence baselines.
+# The calibrator is hash-verified against the policy — the chain is checked,
+# not trusted. Realized residual loss is gated by gates.max_residual_risk
+# (exit 2): plan can pass on expected numbers while backtest fails on drifted
+# reality. Try --scenario drift above to see the alarm trip.
+uv run triage backtest --policy artifacts/policy.json --calibrator artifacts/calibrator.json \
+                    --history data/batch.parquet -o artifacts/backtest.json
+
+# Render the self-contained HTML report (reliability diagram, policy summary,
+# backtest comparison, coverage-vs-risk curves, artifact hash chain)
+uv run triage report --from artifacts -o report.html
 
 # Regenerate the headline chart above (same seed → identical numbers)
 uv run python scripts/headline_chart.py --seed 42 -o docs/headline.png
@@ -86,14 +98,17 @@ never change:
 
 ## Status
 
-MVP complete: input contract, calibration (isotonic/Platt + bootstrap ECE
-CIs), cost model, greedy optimizer, synthetic generator, and this headline
-chart (computed directly from `synth`/`calibration`/`optimizer` by
-`scripts/headline_chart.py`, ahead of the full backtester).
+v1 complete: everything in the MVP (input contract, calibration with
+bootstrap ECE CIs, cost model, greedy optimizer, synthetic generator) plus
+the `backtest` command (policy vs. random and raw-confidence baselines
+replayed on labeled history, with capacity-sweep coverage-vs-risk curves
+embedded in the artifact), a `drift` scenario whose stale policy the
+backtester provably exposes (realized residual ≈ 2.4× expected at seed 42),
+the self-contained HTML `report`, and a CI workflow
+(`.github/workflows/ci.yml`) that runs the exit-code gates for real.
 
-Planned for v1: the `backtest` CLI command (policy vs. baselines replayed on
-labeled history), a drift scenario in `synth`, the HTML report, and CI-ready
-example gate workflows.
+Possible v2 (not started, see GOAL.md): grouped/knapsack routing for
+document-level review.
 
 ## License
 

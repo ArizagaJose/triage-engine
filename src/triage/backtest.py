@@ -14,6 +14,20 @@ sequential sum of per-segment residuals — it is defined as
 are not guaranteed to satisfy `captured + residual == total` at ULP level.
 The same `total_true_loss - captured_loss` definition is used for
 `raw_confidence` and `random` (mean-based), which have no per-segment table.
+
+Capacity-sweep curves (see docs/interfaces.md §9.11): `curves.policy` and
+`curves.raw_confidence` are cumulative true-loss SHARES captured when
+reviewing the top-`k` items of a ranking computed fresh on THIS history, at
+each of 51 grid capacities `k = floor(f * n_history)` for `f` in
+`[0.00, 0.02, ..., 0.50]`. `curves.random` is the analytic expectation
+`k / n_history` (no Monte Carlo). PINNED DIVERGENCE: `curves.policy` at the
+policy's own budget fraction may differ from `strategies.policy.capture_rate`
+— the curve reviews exactly `k` ranked items, while `strategies.policy`
+replays the published per-segment thresholds, which can admit more items
+than planned when the calibrator is a step function and multiple items sit
+exactly at the threshold (tie inflation, point 4 above). Both are correct
+answers to different questions; measured at seed 42, overconfident scenario:
+curve 0.4420 at f=0.10 vs capture_rate 0.5029 at 1183 replayed items.
 """
 
 import math
@@ -32,6 +46,24 @@ from triage.optimizer import PredictsErrors
 
 __all__ = ["BacktestResult", "run", "check_realized_residual_gate"]
 
+# Capacity-sweep grid: review fractions 0.00 ... 0.50 in steps of 0.01 (§9.11).
+_CURVE_GRID: list[float] = [i / 100 for i in range(51)]
+
+
+def _cumulative_shares(
+    order: list[int], true_loss: np.ndarray, ks: list[int], total_true_loss: float
+) -> list[float]:
+    """Cumulative true-loss share captured at each capacity `k` in `ks`, under
+    the item ranking `order` (a list of row indices, most-preferred first).
+
+    `fsum(true_loss over top-k) / total_true_loss`; all-zero if
+    `total_true_loss == 0`.
+    """
+    if total_true_loss == 0.0:
+        return [0.0] * len(ks)
+    ranked_loss = [float(true_loss[i]) for i in order]
+    return [math.fsum(ranked_loss[:k]) / total_true_loss for k in ks]
+
 
 def _require(d: dict[str, Any], key: str, *, context: str) -> Any:
     """Fetch `key` from dict `d`, raising ContractViolation (never KeyError) if absent."""
@@ -45,6 +77,7 @@ class BacktestResult:
     """Backtest outcome: policy replay vs baselines. Mirrors backtest.json minus created_at."""
 
     backtest_hash: str
+    curves: dict[str, Any]
     expected: dict[str, Any]
     input_sha256s: dict[str, str]
     n_errors: int
@@ -59,6 +92,7 @@ class BacktestResult:
         """Return the §7 backtest.json dict, without `created_at` (CLI adds it)."""
         return {
             "backtest_hash": self.backtest_hash,
+            "curves": self.curves,
             "expected": self.expected,
             "input_sha256s": self.input_sha256s,
             "n_errors": self.n_errors,
@@ -247,7 +281,25 @@ def run(
         "capture_rate": random_capture_rate,
     }
 
+    # 11. Capacity-sweep curves: rankings computed fresh on THIS history (not
+    # reusing the threshold-replay review sets above). Policy ranking uses
+    # the same net_benefit DESC / item_id ASC two-stable-sorts idiom as the
+    # optimizer; raw-confidence ranking reuses `order_by_id` (score ASC /
+    # item_id ASC), already computed for the raw_confidence baseline above.
+    net_benefit = p_error * false_accept_costs - review_costs
+    curve_policy_order = sorted(range(n_history), key=lambda i: item_ids[i])
+    curve_policy_order.sort(key=lambda i: -net_benefit[i])
+
+    curve_ks = [math.floor(f * n_history) for f in _CURVE_GRID]
+    curves: dict[str, Any] = {
+        "grid": list(_CURVE_GRID),
+        "policy": _cumulative_shares(curve_policy_order, true_loss, curve_ks, total_true_loss),
+        "raw_confidence": _cumulative_shares(order_by_id, true_loss, curve_ks, total_true_loss),
+        "random": [k / n_history for k in curve_ks],
+    }
+
     backtest_dict: dict[str, Any] = {
+        "curves": curves,
         "expected": expected,
         "input_sha256s": input_sha256s,
         "n_errors": n_errors,
@@ -262,6 +314,7 @@ def run(
 
     return BacktestResult(
         backtest_hash=backtest_hash,
+        curves=curves,
         expected=expected,
         input_sha256s=input_sha256s,
         n_errors=n_errors,

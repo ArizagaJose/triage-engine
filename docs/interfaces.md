@@ -301,6 +301,8 @@ expected_residual_loss, n_review, n_total, review_spend}`).
 repr via json); never round for hashing.
 
 **backtest.json** (v1) top-level keys: `backtest_hash`, `created_at`,
+`curves` (see §9.11 — capacity-sweep capture curves; this is the
+coverage-vs-risk data the report and the README chart render),
 `expected` (`{expected_captured_loss, expected_residual_loss}` — copied
 verbatim from the replayed policy's `totals`, so the report and the drift
 tests can compare modeled vs realized without re-reading policy.json),
@@ -347,6 +349,22 @@ triage backtest --policy artifacts/policy.json --calibrator artifacts/calibrator
   on realized ones.
 - Success prints a one-line summary (n_review, captured, residual,
   backtest_hash prefix, output path) and exits 0.
+
+```
+triage report --from artifacts/ -o report.html
+```
+
+`report` pinned behavior (v1 part 2):
+
+- `--from DIR`: reads `DIR/calibrator.json` and `DIR/policy.json`
+  (REQUIRED — missing or unparseable is `ContractViolation`, exit 1) and
+  `DIR/backtest.json` (OPTIONAL — absent file ⇒ `backtest_dict=None`;
+  present-but-unparseable is still exit 1).
+- Chain verification happens in `report.render` (§11.2); the CLI just
+  loads, calls `render(..., created_at=utc_now_iso(),
+  tool_version=__version__)`, writes the HTML (creating parent dirs like
+  `write_artifact` does), and prints a one-line summary (which artifacts
+  were included + output path). No gates beyond exit 1.
 
 - `--seed` is required-explicit where randomness exists (`synth`, `calibrate`);
   no hidden defaults (typer default allowed but must be a literal, documented).
@@ -464,8 +482,100 @@ Pinned semantics (do not improvise):
    with the per-segment table remaining exact fsums (the tie-out rule in 8
    applies to `captured_loss` only; document this in the module).
 10. Everything float64; no wall-clock, locale, or dict-order dependence.
+11. **Capacity-sweep curves** (`curves` in backtest.json, v1 part 2). The
+    coverage-vs-risk data for the report/README, computed on THIS history:
+    - `curves.grid`: exactly `[i / 100 for i in range(51)]` (review
+      fractions 0.00 … 0.50).
+    - For each grid fraction `f`, capacity `k = floor(f * n_history)`.
+    - `curves.policy[j]`: cumulative true-loss SHARE captured when
+      reviewing the top-`k` items under the OPTIMIZER's ranking
+      (`net_benefit = p_error * false_accept_cost - review_cost` DESC,
+      `item_id` ASC tie-break — same two-stable-sorts idiom), i.e.
+      `fsum(true_loss over top-k) / total_true_loss` (0.0 everywhere if
+      `total_true_loss == 0`).
+    - `curves.raw_confidence[j]`: same, ranking by `score` ASC, `item_id`
+      ASC.
+    - `curves.random[j]`: `k / n_history` exactly (the analytic expectation
+      of uniform sampling; no Monte Carlo here).
+    - NOTE, document in the module: `curves.policy` at the policy's own
+      budget fraction may differ from `strategies.policy.capture_rate` —
+      the curve reviews exactly `k` ranked items while the strategy replays
+      published thresholds (tie inflation, §9.4). Both are correct answers
+      to different questions; measured at seed 42, overconfident:
+      curve 0.4420 at f=0.10 vs capture_rate 0.5029 at 1183 replayed items.
 
-## 10. Repo conventions
+## 11. Report (`src/triage/report.py`) — v1
+
+Static, self-contained HTML: reliability diagrams, coverage-vs-risk curves,
+policy summary, backtest comparison, artifact hash chain. jinja2 + plotly
+only; NO network resources at render OR view time (plotly.js embedded).
+
+```python
+def render(calibrator_dict: dict[str, Any], policy_dict: dict[str, Any],
+           backtest_dict: dict[str, Any] | None, *, created_at: str,
+           tool_version: str) -> str
+```
+
+Pinned semantics:
+
+1. `render` is a PURE function of its arguments — byte-identical HTML for
+   identical inputs. All variance is injected via `created_at` (the CLI
+   passes `utc_now_iso()`), which must appear on exactly one line of the
+   output so determinism tests can strip it
+   (`<p id="created-at">…</p>`).
+2. **Chain verification before rendering** (`ContractViolation` on failure,
+   naming both hashes): `policy.input_sha256s.calibrator ==
+   content_hash(calibrator_dict)`; and if `backtest_dict` is given:
+   `backtest.input_sha256s.policy == policy.policy_hash` AND
+   `backtest.input_sha256s.calibrator == content_hash(calibrator_dict)`.
+   The report renders the chain it verified, never an unchecked one.
+3. `backtest_dict=None`: omit the backtest/curves sections and render a
+   visible note ("backtest not run") — plan-only pipelines still get a
+   report.
+4. Sections: (a) header with tool version, created_at, and the hash table
+   (calibrator `content_hash`, `policy_hash`, `backtest_hash` if present,
+   plus each artifact's recorded `input_sha256s`); (b) calibration —
+   before/after reliability diagram from `calibrator.reliability_bins`
+   (skip `count == 0` bins), method, `ece_raw_holdout` vs `ece_holdout`
+   with the bootstrap CI, `n_golden`, seed; (c) policy summary — budget,
+   totals, per-segment table (threshold, n_review/n_total, expected
+   captured/residual); (d) backtest — expected vs realized residual (the
+   drift signal, called out numerically), strategy comparison table and
+   grouped bar chart (captured loss: policy / raw_confidence /
+   random mean ± std), n_review parity note; (e) coverage-vs-risk — the
+   three `curves` series vs `grid`, with a vertical marker at the policy's
+   own budget fraction.
+5. **Plotly determinism**: every figure gets an EXPLICIT `div_id`
+   (`"fig-reliability"`, `"fig-backtest"`, `"fig-coverage"`); fragments via
+   `to_html(full_html=False, include_plotlyjs=False)` except the FIRST
+   rendered figure which uses `include_plotlyjs=True` (embeds plotly.js
+   once). Never `include_plotlyjs="cdn"` (violates local-first at view
+   time).
+6. Template is a package resource: `src/triage/templates/report.html.j2`,
+   loaded with `jinja2.Environment(loader=PackageLoader("triage"),
+   autoescape=True, keep_trailing_newline=True)`; numbers formatted IN the
+   template/filters with explicit format specs (no locale). Charts reuse
+   the palette of scripts/headline_chart.py (`#2a78d6` policy, `#1baf7a`
+   raw, `#eda100` random, ink `#333333`).
+7. `pyproject.toml` must package the template (hatchling includes
+   `src/triage` by default — verify the built wheel contains it; if a
+   `[tool.hatch.build]` include is needed, add it).
+
+## 12. CI workflow (`.github/workflows/ci.yml`) — v1
+
+Example workflow, also the repo's own CI. Two jobs:
+
+- `checks`: uv sync → `ruff check` + `ruff format --check` → `mypy src/` →
+  `pytest -q`. Python 3.12, `astral-sh/setup-uv`, pinned action versions.
+- `gates` (needs `checks`): the exit-code demo used as a REAL gate —
+  `synth drift --seed 42`, `calibrate --seed 42` (gate `--max-ece 0.05`),
+  `plan`, `backtest`, `report`; then a step that asserts the documented
+  exit codes with a costs.yaml carrying `max_residual_risk: 200000`:
+  `plan` must exit 0 and `backtest` must exit 2 (`if triage backtest …;
+  then exit 1; else test $? -eq 2; fi` idiom, set `-e`-safe). Upload
+  report.html + artifacts as workflow artifacts.
+
+## 13. Repo conventions
 
 - `src/` layout, `uv` managed, Python `>=3.12`.
 - ruff: default rules + `I` (isort); line length 100. mypy: `strict = true`
