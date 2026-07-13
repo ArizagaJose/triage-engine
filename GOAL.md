@@ -103,6 +103,13 @@ Metrics: captured loss, residual loss, review spend, **efficiency (captured
 loss per review)**. The headline README chart comes from here: policy vs both
 baselines across budgets.
 
+The backtester takes the calibrator as an explicit input (the policy's
+thresholds are on calibrated `p_error`, so replay needs the mapping) and
+verifies it against the hash recorded in the policy — the chain is checked,
+not trusted. Realized residual loss is gated by `gates.max_residual_risk`
+(exit 2): `plan` can pass on expected numbers while `backtest` fails on
+realized ones, which is exactly the drift alarm.
+
 ### 5. Report (`report`)
 
 Static HTML (jinja2 + plotly): reliability diagrams, coverage-vs-risk curves,
@@ -125,7 +132,8 @@ the ground truth, every claim is mathematically verifiable. Three scenarios:
 triage calibrate --golden golden.parquet [--seed N] -o calibrator.json
 triage plan --batch batch.parquet --calibrator calibrator.json \
             --costs costs.yaml --budget 0.10 -o policy.json
-triage backtest --policy policy.json --history history.parquet -o backtest.json
+triage backtest --policy policy.json --calibrator calibrator.json \
+                --history history.parquet -o backtest.json
 triage report --from artifacts/ -o report.html
 triage synth --scenario overconfident --seed 42 -o data/
 ```

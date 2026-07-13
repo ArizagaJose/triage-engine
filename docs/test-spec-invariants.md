@@ -1,4 +1,4 @@
-# Invariant test spec (auditor-owned, Stage 4)
+# Invariant test spec (auditor-owned, Stage 4 + Stage 5/v1)
 
 Author: auditor. Implementing agents for WP1–WP7 must NOT edit this file or the
 test files it defines. The Stage-4 implementing agent translates this spec into
@@ -84,6 +84,102 @@ Claims (tolerances chosen for n_batch = 10 000, n_golden = 2 000):
 5. **Realized error rates match injected**: per segment,
    |realized_batch_error_rate − analytic mean of Uniform bounds| ≤ 0.03
    (bounds: seg_high mean 0.155, seg_mid 0.21, seg_low 0.275).
+
+## D. Backtest determinism (Stage 5 — append to `tests/test_determinism.py`
+## or a new `tests/test_determinism_backtest.py`; do NOT edit Stage-4 tests)
+
+Full chain through the REAL CLI: `synth overconfident --seed 42` →
+`calibrate --seed 42` → `plan` (emitted costs.yaml, budget from YAML) →
+`backtest --calibrator ... --seed 42`.
+
+1. `backtest` run twice on the same inputs → the two backtest.json files are
+   identical after removing `created_at`; `backtest_hash` values equal AND
+   `backtest_hash == content_hash(parsed_backtest)` recomputed in the test.
+2. `backtest --seed 43` → `strategies.random.captured_loss_mean` DIFFERS
+   (guards against the seed being ignored) while the `policy` and
+   `raw_confidence` strategy blocks are IDENTICAL dicts (no randomness may
+   leak into them).
+3. Hash-chain: `input_sha256s.policy` equals the policy.json's own
+   `policy_hash`; `input_sha256s.calibrator` equals
+   `policy.input_sha256s.calibrator`.
+4. Tamper check: `calibrate --seed 43` into a different calibrator.json, then
+   `backtest` with the seed-42 policy and the seed-43 calibrator → exit 1,
+   stderr names the hash mismatch.
+
+## E. Backtest golden file (Stage 5 — `tests/test_golden.py` pattern, new
+## file `tests/test_golden_backtest.py`)
+
+- Committed fixture `tests/golden/backtest.json`: produced by the real CLI on
+  the well_calibrated seed-7 chain (same chain as the policy fixture:
+  synth well_calibrated --seed 7, calibrate seed 7, plan with emitted costs,
+  then backtest with --history = the same batch.parquet, --seed 7). Generated
+  and committed by the auditor on 2026-07-12 (`backtest_hash` prefix
+  `b905edd6c077`; the same chain reproduced the policy fixture's
+  `d797f827317e`, confirming the content_hash amendment left MVP hashes
+  untouched). The test regenerates end-to-end into tmp and compares equality
+  after deleting `created_at` in both.
+- Self-consistency: fixture's `backtest_hash == content_hash(fixture)`.
+
+## F. Backtest + drift claim verification (Stage 5 — new file
+## `tests/test_claims_backtest.py`; session-scoped fixtures; real CLI)
+
+Chains (all seed 42, budget 0.10 from the emitted costs.yaml, backtest
+--seed 42, --n-random-draws 200, history = the scenario's own batch.parquet):
+`well_calibrated`, `overconfident`, `drift`.
+
+Auditor's measured values at seed 42 are given in parentheses; tolerances are
+pinned with margin. If a bound fails empirically, report the actual number to
+the auditor — do NOT silently loosen it.
+
+1. **Threshold replay is faithful**: for `well_calibrated` (platt selected),
+   `strategies.policy.n_review == ` policy `totals.n_review` exactly
+   (measured 1000 == 1000). For `overconfident` (isotonic selected), tie
+   inflation is expected: planned ≤ replayed ≤ 1.3 × planned
+   (measured 1183 vs 1000 planned).
+2. **Policy beats baselines at equal capacity** (overconfident):
+   `strategies.policy.captured_loss ≥ 1.15 × strategies.raw_confidence.captured_loss`
+   (measured ratio ≈ 17.9×) and `> strategies.random.captured_loss_mean`
+   (measured 144500 vs 34170). `strategies.policy.capture_rate ≥ 0.40`
+   (measured 0.5029).
+3. **Random baseline sanity**: `strategies.random.capture_rate` within ±0.03
+   of `n_review / n_history` (uniform sampling captures ≈ the review
+   fraction; measured 0.1189 vs 0.1183 for overconfident, 0.1004 vs 0.1000
+   for well_calibrated).
+4. **Drift is exposed**: for `drift`,
+   `strategies.policy.residual_loss / expected.expected_residual_loss ≥ 1.8`
+   (measured 2.355 — the injected drift_factor is 2.0). Controls: the same
+   ratio for `well_calibrated` and `overconfident` lies in [0.7, 1.4]
+   (measured 1.131 and 0.984).
+5. **Drift injection matches analytic**: per segment, manifest
+   `realized_mean_error_batch` within ±0.03 of
+   `min(drift_factor * mean(Uniform bounds), 0.95)`: seg_high 0.31,
+   seg_mid 0.42, seg_low 0.55 (measured 0.297, 0.418, 0.555). Golden rates
+   still match the UNdrifted means of spec C.5 (golden is pre-drift) with a
+   GOLDEN-TIER tolerance of ±0.045 — NOT C.5's ±0.03, which was validated
+   only at n_batch=10 000. n_golden=2 000 (~667 rows/segment) has sd of the
+   realized mean ≈ 0.014 for seg_high, and the measured seed-42 value is
+   0.1218 vs analytic 0.155 (diff 0.0332, ≈2.3σ — sampling noise, verified
+   scenario-independent). ±0.045 ≈ 3.1σ. [Auditor amendment 2026-07-12: the
+   original spec text borrowed ±0.03 unvalidated at golden scale; the
+   Stage-5 test agent correctly left the test failing and reported the
+   number instead of weakening the bound.]
+6. **Accounting closes**: for every strategy,
+   `captured + residual == total_true_loss` exactly (residual is defined as
+   the difference, §9.9 of interfaces.md — assert equality, it documents the
+   convention); `strategies.policy.captured_loss` equals the sequential sum
+   of its per-segment `captured_loss` in sorted segment order exactly;
+   `total_true_loss` equals an independent in-test fsum of
+   `(predicted != true) * false_accept_cost` over the history;
+   `n_errors` equals the in-test error count.
+7. **Drift CI gate story** (exit codes are the product): write a costs.yaml
+   identical to the emitted one plus `gates.max_residual_risk: 200000`.
+   On the drift chain: `plan` exits 0 (expected residual ≈ 142706 ≤ 200000)
+   but `backtest` exits 2 (realized residual ≈ 336100 > 200000), and
+   backtest.json EXISTS afterward (artifact-first rule). On the
+   well_calibrated chain with the same gate: both exit 0
+   (realized residual ≈ 161350 ≤ 200000).
+8. **History without labels** → `backtest` exits 1 (drop `true_value` from
+   the history parquet).
 
 ## Rules for the implementing agent
 

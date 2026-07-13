@@ -13,10 +13,13 @@ def canonical_dumps(obj: dict[str, Any]) -> str:
 
 
 def content_hash(obj: dict[str, Any]) -> str:
-    """SHA256 hash of canonical JSON, ignoring 'created_at' and 'policy_hash' at top level."""
+    """SHA256 hash of canonical JSON, ignoring 'created_at', 'policy_hash', and
+    'backtest_hash' at top level (popping an absent key is a no-op, so MVP hashes
+    are unchanged)."""
     obj_copy = obj.copy()
     obj_copy.pop("created_at", None)
     obj_copy.pop("policy_hash", None)
+    obj_copy.pop("backtest_hash", None)
     canonical = canonical_dumps(obj_copy)
     return hashlib.sha256(canonical.encode()).hexdigest()
 

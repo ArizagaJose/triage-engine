@@ -12,10 +12,11 @@ from pydantic import ValidationError
 from typer._click.exceptions import ClickException
 
 from triage import __version__, artifacts, calibration, contract, optimizer
+from triage import backtest as backtest_module
 from triage import costs as costs_module
 from triage import synth as synth_module
 from triage.calibration import Calibrator
-from triage.costs import Budget
+from triage.costs import Budget, CostModel
 from triage.exceptions import CalibrationGateFailed, ContractViolation, ResidualRiskExceeded
 
 app = typer.Typer()
@@ -23,7 +24,9 @@ app = typer.Typer()
 
 @app.command()
 def synth(
-    scenario: str = typer.Option(..., help="Scenario: 'well_calibrated' or 'overconfident'"),
+    scenario: str = typer.Option(
+        ..., help="Scenario: 'well_calibrated', 'overconfident', or 'drift'"
+    ),
     seed: int = typer.Option(42, help="Random seed"),
     out_dir: Path = typer.Option(
         ...,
@@ -131,6 +134,90 @@ def plan(
         f"captured={totals['expected_captured_loss']:.1f} "
         f"residual={totals['expected_residual_loss']:.1f} "
         f"policy_hash={policy.policy_hash[:12]} -> {output}"
+    )
+
+
+@app.command()
+def backtest(
+    policy: Path = typer.Option(..., help="Path to policy.json"),
+    calibrator: Path = typer.Option(..., help="Path to calibrator.json"),
+    history: Path = typer.Option(..., help="Path to labeled history (parquet or CSV)"),
+    seed: int = typer.Option(42, help="Random seed for the random-routing baseline"),
+    n_random_draws: int = typer.Option(200, help="Number of random-baseline draws"),
+    output: Path = typer.Option(
+        ...,
+        "--output",
+        "-o",
+        help="Output path for backtest.json",
+    ),
+) -> None:
+    """Replay a policy against labeled history and compare it to baselines."""
+    try:
+        policy_text = policy.read_text()
+    except OSError as e:
+        raise ContractViolation(f"Cannot read policy file {policy}: {e}") from e
+    try:
+        policy_dict = json.loads(policy_text)
+    except json.JSONDecodeError as e:
+        raise ContractViolation(f"Policy file {policy} is not valid JSON: {e}") from e
+
+    try:
+        calibrator_text = calibrator.read_text()
+    except OSError as e:
+        raise ContractViolation(f"Cannot read calibrator file {calibrator}: {e}") from e
+    try:
+        calibrator_dict = json.loads(calibrator_text)
+    except json.JSONDecodeError as e:
+        raise ContractViolation(f"Calibrator file {calibrator} is not valid JSON: {e}") from e
+    try:
+        cal = Calibrator.from_dict(calibrator_dict)
+    except KeyError as e:
+        raise ContractViolation(f"Calibrator file {calibrator} is missing key {e}") from e
+
+    # The policy's thresholds are on calibrated p_error; verify the calibrator
+    # supplied here is the one that produced them, not merely a compatible one.
+    calibrator_hash = artifacts.content_hash(calibrator_dict)
+    policy_calibrator_hash = policy_dict.get("input_sha256s", {}).get("calibrator")
+    if calibrator_hash != policy_calibrator_hash:
+        raise ContractViolation(
+            f"Calibrator mismatch: {calibrator} hashes to {calibrator_hash!r}, but policy "
+            f"{policy} was planned with calibrator hash {policy_calibrator_hash!r}"
+        )
+
+    history_df = contract.read_input(history, require_truth=True)
+
+    input_sha256s = {
+        "calibrator": calibrator_hash,
+        "history": artifacts.file_sha256(history),
+        "policy": artifacts.content_hash(policy_dict),
+    }
+
+    result = backtest_module.run(
+        policy_dict,
+        cal,
+        history_df,
+        seed=seed,
+        n_random_draws=n_random_draws,
+        input_sha256s=input_sha256s,
+        tool_version=__version__,
+    )
+
+    artifact_dict = result.to_dict()
+    artifact_dict["created_at"] = artifacts.utc_now_iso()
+    artifacts.write_artifact(artifact_dict, output)
+
+    try:
+        cost_model = CostModel.model_validate(policy_dict.get("config_snapshot", {}))
+    except ValidationError as e:
+        raise ContractViolation(f"policy.config_snapshot failed validation: {e}") from e
+    backtest_module.check_realized_residual_gate(result, cost_model)
+
+    policy_strategy = result.strategies["policy"]
+    typer.echo(
+        f"n_review={policy_strategy['n_review']} "
+        f"captured={policy_strategy['captured_loss']:.1f} "
+        f"residual={policy_strategy['residual_loss']:.1f} "
+        f"backtest_hash={result.backtest_hash[:12]} -> {output}"
     )
 
 
