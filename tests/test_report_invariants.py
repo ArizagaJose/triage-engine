@@ -27,6 +27,8 @@ from typing import Any
 import pytest
 
 from triage.artifacts import content_hash
+from triage.exceptions import ContractViolation
+from triage.report import render
 
 TRIAGE_BIN = shutil.which("triage") or str(Path(__file__).resolve().parents[1] / ".venv/bin/triage")
 
@@ -251,6 +253,59 @@ def test_report_missing_policy_exits_1(report_session: Path, full_chain_dir: Pat
     assert result.returncode == 1, result.stderr
 
 
+def test_report_tampered_policy_content_raises(full_chain_dicts: dict[str, Any]) -> None:
+    """A policy dict whose semantic content (totals) was mutated after hashing,
+    with policy_hash left untouched, must be rejected by render() -- the
+    declared policy_hash no longer matches content_hash(policy)."""
+    calibrator = full_chain_dicts["calibrator"]
+    tampered_policy = json.loads(json.dumps(full_chain_dicts["policy"]))
+    totals = tampered_policy["totals"]
+    key = next(iter(totals))
+    totals[key] = (totals[key] or 0) + 1.0
+    backtest = full_chain_dicts["backtest"]
+
+    with pytest.raises(ContractViolation, match="policy_hash"):
+        render(
+            calibrator,
+            tampered_policy,
+            backtest,
+            created_at="2020-01-01T00:00:00Z",
+            tool_version="test",
+        )
+
+
+def test_report_tampered_backtest_content_raises(full_chain_dicts: dict[str, Any]) -> None:
+    """A backtest dict whose semantic content (total_true_loss) was mutated
+    after hashing, with backtest_hash left untouched, must be rejected by
+    render() -- the declared backtest_hash no longer matches
+    content_hash(backtest)."""
+    calibrator = full_chain_dicts["calibrator"]
+    policy = full_chain_dicts["policy"]
+    tampered_backtest = json.loads(json.dumps(full_chain_dicts["backtest"]))
+    tampered_backtest["total_true_loss"] = (tampered_backtest["total_true_loss"] or 0) + 1.0
+
+    with pytest.raises(ContractViolation, match="backtest_hash"):
+        render(
+            calibrator,
+            policy,
+            tampered_backtest,
+            created_at="2020-01-01T00:00:00Z",
+            tool_version="test",
+        )
+
+
+def test_report_valid_triple_still_renders(full_chain_dicts: dict[str, Any]) -> None:
+    """A fully valid, untampered triple must still render successfully."""
+    html = render(
+        full_chain_dicts["calibrator"],
+        full_chain_dicts["policy"],
+        full_chain_dicts["backtest"],
+        created_at="2020-01-01T00:00:00Z",
+        tool_version="test",
+    )
+    assert full_chain_dicts["policy"]["policy_hash"] in html
+
+
 # --- G.8: backtest-optional ---
 
 
@@ -282,6 +337,32 @@ def test_report_with_backtest_note_absent(report_pair: tuple[Path, Path]) -> Non
 
 
 # --- G.9: report is not an exit-code gate ---
+
+
+# --- Gates panel (docs/interfaces.md §11.4(f)) ---
+
+
+def test_report_contains_gates_section_with_computed_verdict(
+    report_pair: tuple[Path, Path], full_chain_dicts: dict[str, Any]
+) -> None:
+    """The real CLI-driven report renders a Gates section, and the max_ece
+    verdict matches the strict `>` comparison against the actual chain
+    values (not hardcoded)."""
+    out_a, _ = report_pair
+    html = out_a.read_text()
+    assert "<h2>Gates</h2>" in html
+
+    gates = full_chain_dicts["policy"]["config_snapshot"]["gates"]
+    max_ece = gates.get("max_ece")
+    ece_holdout = full_chain_dicts["calibrator"]["ece_holdout"]
+
+    gates_section = html.split("<h2>Gates</h2>", 1)[1].split("<h2>Backtest</h2>", 1)[0]
+    assert "max_ece" in gates_section
+    if max_ece is None:
+        assert "not set" in gates_section
+    else:
+        expected_verdict = "FAIL" if ece_holdout > max_ece else "PASS"
+        assert f">{expected_verdict}<" in gates_section
 
 
 def test_report_drift_chain_exits_0(report_session: Path) -> None:

@@ -111,6 +111,29 @@
     {% endfor %}
   </table>
 
+  <h2>Gates</h2>
+  <p class="meta">Informational only: declared thresholds vs measured values. This report is not an exit-code gate (see <code>triage plan</code> / <code>triage backtest</code>).</p>
+  <table>
+    <tr><th>gate</th><th>threshold</th><th>value</th><th>verdict</th></tr>
+    {% for row in gates.rows %}
+    {% set fmt = "%.4f" if row.kind == "ece" else "%.2f" %}
+    <tr>
+      <td>{{ row.name }}</td>
+      <td>{% if row.threshold is none %}not set{% else %}{{ fmt|format(row.threshold) }}{% endif %}</td>
+      <td>{% if row.value is none %}&mdash;{% else %}{{ fmt|format(row.value) }}{% endif %}</td>
+      <td>{% if row.verdict == "PASS" %}PASS{% elif row.verdict == "FAIL" %}FAIL{% else %}&mdash;{% endif %}</td>
+    </tr>
+    {% endfor %}
+    {% if gates.adherence %}
+    <tr>
+      <td>budget adherence (planned vs replayed n_review)</td>
+      <td>&mdash;</td>
+      <td>{{ gates.adherence.planned_n_review }} vs {{ gates.adherence.replayed_n_review }} (ratio {% if gates.adherence.ratio is none %}&mdash;{% else %}{{ "%.3f"|format(gates.adherence.ratio) }}{% endif %})</td>
+      <td>&mdash;</td>
+    </tr>
+    {% endif %}
+  </table>
+
   <h2>Backtest</h2>
   {% if backtest %}
   <p class="meta">

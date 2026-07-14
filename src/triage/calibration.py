@@ -15,7 +15,7 @@ from sklearn.linear_model import LogisticRegression
 
 from triage import __version__
 from triage.contract import validate
-from triage.exceptions import CalibrationGateFailed
+from triage.exceptions import CalibrationGateFailed, ContractViolation
 
 
 @dataclass(frozen=True)
@@ -240,6 +240,15 @@ def fit(
     cal_idx, holdout_idx = _split_indices(
         item_ids, seed=seed, holdout_fraction=config.holdout_fraction
     )
+
+    n_cal = len(cal_idx)
+    n_holdout = len(holdout_idx)
+    if n_cal == 0 or n_holdout == 0:
+        raise ContractViolation(
+            f"Golden set too small to calibrate: n_golden={golden.height}, "
+            f"holdout_fraction={config.holdout_fraction} yields n_calibration={n_cal}, "
+            f"n_holdout={n_holdout}; both splits must be non-empty"
+        )
 
     score_cal = scores_all[cal_idx]
     error_cal = error_all[cal_idx]

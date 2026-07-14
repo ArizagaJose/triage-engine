@@ -41,10 +41,15 @@ from pydantic import ValidationError
 from triage import contract
 from triage.artifacts import content_hash
 from triage.costs import CostModel
-from triage.exceptions import ContractViolation, ResidualRiskExceeded
+from triage.exceptions import BudgetOverrunExceeded, ContractViolation, ResidualRiskExceeded
 from triage.optimizer import PredictsErrors
 
-__all__ = ["BacktestResult", "run", "check_realized_residual_gate"]
+__all__ = [
+    "BacktestResult",
+    "run",
+    "check_realized_residual_gate",
+    "check_budget_overrun_gate",
+]
 
 # Capacity-sweep grid: review fractions 0.00 ... 0.50 in steps of 0.01 (§9.11).
 _CURVE_GRID: list[float] = [i / 100 for i in range(51)]
@@ -336,4 +341,30 @@ def check_realized_residual_gate(result: BacktestResult, cost_model: CostModel) 
     if residual > max_residual_risk:
         raise ResidualRiskExceeded(
             f"Realized residual loss {residual} exceeds gates.max_residual_risk {max_residual_risk}"
+        )
+
+
+def check_budget_overrun_gate(
+    result: BacktestResult, cost_model: CostModel, max_budget_overrun: float | None
+) -> None:
+    """Raise BudgetOverrunExceeded if replayed capacity exceeds --max-budget-overrun."""
+    if max_budget_overrun is None:
+        return
+    if max_budget_overrun < 1.0:
+        raise ContractViolation(f"--max-budget-overrun must be >= 1.0, got {max_budget_overrun}")
+    budget = cost_model.budget
+    policy_strategy = result.strategies["policy"]
+    if budget.type == "fraction":
+        allowed: float = budget.value * result.n_history
+        actual: float = policy_strategy["n_review"]
+    elif budget.type == "count":
+        allowed = budget.value
+        actual = policy_strategy["n_review"]
+    else:  # money
+        allowed = budget.value
+        actual = policy_strategy["review_spend"]
+    if actual > max_budget_overrun * allowed:
+        raise BudgetOverrunExceeded(
+            f"Replayed capacity {actual} exceeds {max_budget_overrun} x allowed {allowed} "
+            f"(budget type={budget.type!r})"
         )

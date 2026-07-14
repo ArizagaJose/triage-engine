@@ -354,3 +354,108 @@ class TestEscaping:
         )
         assert "<script>alert(1)</script>" not in html
         assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+
+
+class TestGates:
+    """Spec: docs/interfaces.md §11.4(f) -- informational gates panel."""
+
+    def test_gates_section_present_with_max_ece_verdict(self) -> None:
+        calibrator_dict, policy_dict, backtest_dict = _valid_triplet()
+        html = render(
+            calibrator_dict,
+            policy_dict,
+            backtest_dict,
+            created_at=CREATED_AT,
+            tool_version=TOOL_VERSION,
+        )
+        assert "<h2>Gates</h2>" in html
+
+        # Compute the expected verdict from the fixture's own values rather
+        # than hardcoding it: fixture costs set max_ece=0.05, calibrator
+        # ece_holdout=0.05 -> strict `>` means this is a PASS, not a FAIL.
+        max_ece = policy_dict["config_snapshot"]["gates"]["max_ece"]
+        ece_holdout = calibrator_dict["ece_holdout"]
+        assert max_ece is not None
+        expected_verdict = "FAIL" if ece_holdout > max_ece else "PASS"
+        assert expected_verdict == "PASS"  # sanity: fixture is 0.05 vs 0.05
+
+        gates_section = html.split("<h2>Gates</h2>", 1)[1].split("<h2>Backtest</h2>", 1)[0]
+        assert "max_ece" in gates_section
+        assert f">{expected_verdict}<" in gates_section
+
+    def test_gate_threshold_null_renders_not_set(self) -> None:
+        calibrator_dict, policy_dict, backtest_dict = _valid_triplet()
+        policy_dict = copy.deepcopy(policy_dict)
+        backtest_dict = copy.deepcopy(backtest_dict)
+
+        # Both gates are already null/absent in the fixture's max_residual_risk;
+        # additionally null out max_ece to exercise the "not set" path for it too.
+        policy_dict["config_snapshot"]["gates"]["max_ece"] = None
+        policy_dict["policy_hash"] = content_hash(policy_dict)
+        backtest_dict["input_sha256s"]["policy"] = policy_dict["policy_hash"]
+        backtest_dict["backtest_hash"] = content_hash(backtest_dict)
+
+        html = render(
+            calibrator_dict,
+            policy_dict,
+            backtest_dict,
+            created_at=CREATED_AT,
+            tool_version=TOOL_VERSION,
+        )
+        gates_section = html.split("<h2>Gates</h2>", 1)[1].split("<h2>Backtest</h2>", 1)[0]
+        assert gates_section.count("not set") >= 2  # max_ece and max_residual_risk (planned)
+
+    def test_failing_gate_renders_fail_and_does_not_raise(self) -> None:
+        calibrator_dict, policy_dict, backtest_dict = _valid_triplet()
+        policy_dict = copy.deepcopy(policy_dict)
+        backtest_dict = copy.deepcopy(backtest_dict)
+
+        # Set max_ece below the calibrator's actual ece_holdout (0.05) so the
+        # gate strictly fails.
+        policy_dict["config_snapshot"]["gates"]["max_ece"] = 0.01
+        policy_dict["policy_hash"] = content_hash(policy_dict)
+        backtest_dict["input_sha256s"]["policy"] = policy_dict["policy_hash"]
+        backtest_dict["backtest_hash"] = content_hash(backtest_dict)
+
+        assert calibrator_dict["ece_holdout"] > 0.01  # sanity: gate must actually fail
+
+        html = render(
+            calibrator_dict,
+            policy_dict,
+            backtest_dict,
+            created_at=CREATED_AT,
+            tool_version=TOOL_VERSION,
+        )
+        gates_section = html.split("<h2>Gates</h2>", 1)[1].split("<h2>Backtest</h2>", 1)[0]
+        assert ">FAIL<" in gates_section
+
+    def test_gates_present_without_backtest_no_realized_or_adherence_rows(self) -> None:
+        calibrator_dict, policy_dict, _ = _valid_triplet()
+        html = render(
+            calibrator_dict, policy_dict, None, created_at=CREATED_AT, tool_version=TOOL_VERSION
+        )
+        assert "<h2>Gates</h2>" in html
+        gates_section = html.split("<h2>Gates</h2>", 1)[1].split("<h2>Backtest</h2>", 1)[0]
+        assert "max_residual_risk (planned)" in gates_section
+        assert "max_residual_risk (realized)" not in gates_section
+        assert "budget adherence" not in gates_section
+
+    def test_gates_render_is_pure(self) -> None:
+        calibrator_dict, policy_dict, backtest_dict = _valid_triplet()
+        html1 = render(
+            calibrator_dict,
+            policy_dict,
+            backtest_dict,
+            created_at=CREATED_AT,
+            tool_version=TOOL_VERSION,
+        )
+        html2 = render(
+            copy.deepcopy(calibrator_dict),
+            copy.deepcopy(policy_dict),
+            copy.deepcopy(backtest_dict),
+            created_at=CREATED_AT,
+            tool_version=TOOL_VERSION,
+        )
+        gates1 = html1.split("<h2>Gates</h2>", 1)[1].split("<h2>Backtest</h2>", 1)[0]
+        gates2 = html2.split("<h2>Gates</h2>", 1)[1].split("<h2>Backtest</h2>", 1)[0]
+        assert gates1 == gates2

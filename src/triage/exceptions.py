@@ -15,3 +15,7 @@ class ResidualRiskExceeded(TriageError):
 
 class CalibrationGateFailed(TriageError):
     """ECE above the declared maximum. CLI exit code 3."""
+
+
+class BudgetOverrunExceeded(TriageError):
+    """Replayed review capacity above --max-budget-overrun. CLI exit code 5."""

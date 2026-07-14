@@ -13,7 +13,7 @@ from triage.calibration import (
     ece,
     fit,
 )
-from triage.exceptions import CalibrationGateFailed
+from triage.exceptions import CalibrationGateFailed, ContractViolation
 
 
 def _make_golden(n: int, *, seed: int, score_fn: str = "well_calibrated") -> pl.DataFrame:
@@ -309,3 +309,43 @@ def test_all_error_golden_selects_isotonic_constant_one() -> None:
     x = np.array([0.0, 0.5, 1.0])
     assert np.array_equal(cal.predict(x), restored.predict(x))
     canonical_dumps(cal.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# Degenerate input: empty splits
+# ---------------------------------------------------------------------------
+
+
+def test_fit_one_row_golden_empty_holdout() -> None:
+    """1-row golden set with default holdout_fraction=0.3 yields empty holdout."""
+    golden = _make_golden(1, seed=99)
+    with pytest.raises(ContractViolation) as exc_info:
+        fit(golden, seed=99)
+    message = str(exc_info.value)
+    assert "n_golden=1" in message
+    assert "n_calibration" in message
+    assert "n_holdout" in message
+
+
+def test_fit_zero_holdout_fraction_empty_holdout() -> None:
+    """100-row golden set with holdout_fraction=0.0 yields empty holdout."""
+    golden = _make_golden(100, seed=100)
+    config = CalibrationConfig(holdout_fraction=0.0)
+    with pytest.raises(ContractViolation) as exc_info:
+        fit(golden, seed=100, config=config)
+    message = str(exc_info.value)
+    assert "n_golden=100" in message
+    assert "n_calibration" in message
+    assert "n_holdout" in message
+
+
+def test_fit_one_holdout_fraction_empty_calibration() -> None:
+    """100-row golden set with holdout_fraction=1.0 yields empty calibration."""
+    golden = _make_golden(100, seed=101)
+    config = CalibrationConfig(holdout_fraction=1.0)
+    with pytest.raises(ContractViolation) as exc_info:
+        fit(golden, seed=101, config=config)
+    message = str(exc_info.value)
+    assert "n_golden=100" in message
+    assert "n_calibration=0" in message
+    assert "n_holdout=100" in message

@@ -52,19 +52,36 @@ def _verify_chain(
             f"{declared_calibrator_hash!r} but content_hash(calibrator)={calibrator_hash!r}"
         )
 
+    # Policy self-check: the artifact must hash to its own declared policy_hash.
+    declared_policy_hash = policy_dict.get("policy_hash")
+    policy_hash = content_hash(policy_dict)
+    if policy_hash != declared_policy_hash:
+        raise ContractViolation(
+            "Report chain broken: policy.policy_hash="
+            f"{declared_policy_hash!r} but content_hash(policy)={policy_hash!r}"
+        )
+
     if backtest_dict is not None:
-        policy_hash = policy_dict.get("policy_hash")
-        declared_policy_hash = backtest_dict.get("input_sha256s", {}).get("policy")
-        if declared_policy_hash != policy_hash:
+        declared_bt_policy_hash = backtest_dict.get("input_sha256s", {}).get("policy")
+        if declared_bt_policy_hash != policy_hash:
             raise ContractViolation(
                 "Report chain broken: backtest.input_sha256s.policy="
-                f"{declared_policy_hash!r} but policy.policy_hash={policy_hash!r}"
+                f"{declared_bt_policy_hash!r} but policy.policy_hash={policy_hash!r}"
             )
         declared_bt_calibrator_hash = backtest_dict.get("input_sha256s", {}).get("calibrator")
         if declared_bt_calibrator_hash != calibrator_hash:
             raise ContractViolation(
                 "Report chain broken: backtest.input_sha256s.calibrator="
                 f"{declared_bt_calibrator_hash!r} but content_hash(calibrator)={calibrator_hash!r}"
+            )
+
+        # Backtest self-check: the artifact must hash to its own declared backtest_hash.
+        declared_backtest_hash = backtest_dict.get("backtest_hash")
+        backtest_hash = content_hash(backtest_dict)
+        if backtest_hash != declared_backtest_hash:
+            raise ContractViolation(
+                "Report chain broken: backtest.backtest_hash="
+                f"{declared_backtest_hash!r} but content_hash(backtest)={backtest_hash!r}"
             )
 
     return calibrator_hash
@@ -238,6 +255,65 @@ def _coverage_figure(
     return html
 
 
+def _gate_row(
+    name: str, threshold: float | None, value: float | None, *, kind: str
+) -> dict[str, Any]:
+    """Build one verdict-bearing gates row: FAIL iff value > threshold (strict,
+    matching calibration.check_ece_gate), "not set" if threshold is null/absent.
+    `kind` ("ece" or "loss") selects the template's number format."""
+    if threshold is None or value is None:
+        verdict = "not set"
+    elif value > threshold:
+        verdict = "FAIL"
+    else:
+        verdict = "PASS"
+    return {"name": name, "threshold": threshold, "value": value, "verdict": verdict, "kind": kind}
+
+
+def _build_gates_view(
+    calibrator_dict: dict[str, Any],
+    policy_dict: dict[str, Any],
+    backtest_dict: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Purely informational gates table per docs/interfaces.md §11.4(f). Never
+    raises: absent/None thresholds render as "not set", not an error."""
+    gates = policy_dict.get("config_snapshot", {}).get("gates", {}) or {}
+    max_ece = gates.get("max_ece")
+    max_residual_risk = gates.get("max_residual_risk")
+
+    rows: list[dict[str, Any]] = [
+        _gate_row("max_ece", max_ece, calibrator_dict["ece_holdout"], kind="ece"),
+        _gate_row(
+            "max_residual_risk (planned)",
+            max_residual_risk,
+            policy_dict.get("totals", {}).get("expected_residual_loss"),
+            kind="loss",
+        ),
+    ]
+
+    adherence: dict[str, Any] | None = None
+    if backtest_dict is not None:
+        policy_strategy = backtest_dict["strategies"]["policy"]
+        rows.append(
+            _gate_row(
+                "max_residual_risk (realized)",
+                max_residual_risk,
+                policy_strategy["residual_loss"],
+                kind="loss",
+            )
+        )
+        planned_n_review = int(policy_dict.get("totals", {}).get("n_review", 0) or 0)
+        replayed_n_review = int(policy_strategy["n_review"])
+        ratio = (replayed_n_review / planned_n_review) if planned_n_review else None
+        adherence = {
+            "planned_n_review": planned_n_review,
+            "replayed_n_review": replayed_n_review,
+            "ratio": ratio,
+        }
+
+    return {"rows": rows, "adherence": adherence}
+
+
 def render(
     calibrator_dict: dict[str, Any],
     policy_dict: dict[str, Any],
@@ -322,6 +398,8 @@ def render(
         "segments": sorted(policy_dict.get("segments", {}).items(), key=lambda kv: kv[0]),
     }
 
+    gates_view = _build_gates_view(calibrator_dict, policy_dict, backtest_dict)
+
     env = Environment(
         loader=PackageLoader("triage"),
         autoescape=select_autoescape(default=True, default_for_string=True),
@@ -334,6 +412,7 @@ def render(
         hash_rows=hash_rows,
         calibration=calibration_view,
         policy=policy_view,
+        gates=gates_view,
         backtest=backtest_view,
         figs=figs,
         budget_fraction=budget_fraction,

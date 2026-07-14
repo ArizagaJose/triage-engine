@@ -137,7 +137,11 @@ Pinned algorithm details:
 
 - **Split**: sort rows by `item_id` (stable), then permute with
   `np.random.default_rng(seed)`; last `holdout_fraction` of the permutation is
-  the holdout. Never use sklearn's splitters.
+  the holdout. Never use sklearn's splitters. Both splits MUST be non-empty:
+  if rounding yields `n_holdout == 0` or `n_calibration == 0` (tiny golden
+  set or extreme `holdout_fraction`), `fit` raises `ContractViolation`
+  (exit 1) naming the sizes — an empty holdout would report `ece_holdout=0.0`
+  and pass the ECE gate with zero validation evidence.
 - **Isotonic**: `sklearn.isotonic.IsotonicRegression(y_min=0.0, y_max=1.0,
   increasing="auto", out_of_bounds="clip")` fit on `(score, error)` of the
   calibration split.
@@ -344,9 +348,23 @@ triage backtest --policy artifacts/policy.json --calibrator artifacts/calibrator
   help). `--n-random-draws` default 200.
 - Gating order: write backtest.json FIRST, then
   `check_realized_residual_gate` (exit 2) against
-  `gates.max_residual_risk` from the policy's `config_snapshot`. This is the
-  CI drift gate: `plan` can pass on expected numbers while `backtest` fails
-  on realized ones.
+  `gates.max_residual_risk` from the policy's `config_snapshot`, then
+  `check_budget_overrun_gate` (exit 5) if `--max-budget-overrun` was given.
+  This is the CI drift gate: `plan` can pass on expected numbers while
+  `backtest` fails on realized ones.
+- `--max-budget-overrun FACTOR` (optional, float, no default): budget
+  overrun gate, exit 5 (`BudgetOverrunExceeded`). Deliberately a CLI flag,
+  NOT a `gates:` YAML field — a new `Gates` field would change
+  `config_snapshot` in every policy.json and hence every `policy_hash`,
+  breaking golden artifacts (see docs/risk-register.md R1). `FACTOR < 1.0`
+  is a `ContractViolation` (exit 1). Pinned formula, from the policy's
+  `config_snapshot.budget` applied to THIS history: allowed capacity =
+  `value * n_history` (fraction, un-floored) or `value` (count), compared
+  against replayed `strategies.policy.n_review`; for money budgets,
+  allowed = `value` compared against replayed
+  `strategies.policy.review_spend`. Fail iff `actual > FACTOR * allowed`
+  (strict). The replay itself is NEVER capped (§9.4) — the gate only
+  refuses to bless the result.
 - Success prints a one-line summary (n_review, captured, residual,
   backtest_hash prefix, output path) and exits 0.
 
@@ -383,7 +401,8 @@ triage report --from artifacts/ -o report.html
   reproducibility across independent end-to-end runs.
 - Exit-code mapping in ONE place (a `main`-level try/except):
   `ContractViolation → 1`, `ResidualRiskExceeded → 2`,
-  `CalibrationGateFailed → 3`, other `Exception → 4` (message to stderr,
+  `CalibrationGateFailed → 3`, `BudgetOverrunExceeded → 5`,
+  other `Exception → 4` (message to stderr,
   traceback only with `--verbose`). Success prints a one-line summary to
   stdout and exits 0.
 - Pinned: the typer app runs with `standalone_mode=False`; bad CLI usage
@@ -414,6 +433,13 @@ def run(policy_dict: dict[str, Any], calibrator: PredictsErrors,
 def check_realized_residual_gate(result: BacktestResult,
                                  cost_model: CostModel) -> None
     # raises ResidualRiskExceeded if strategies.policy.residual_loss >
+
+def check_budget_overrun_gate(result: BacktestResult, cost_model: CostModel,
+                              max_budget_overrun: float | None) -> None
+    # None -> no-op. FACTOR < 1.0 -> ContractViolation. Otherwise raises
+    # BudgetOverrunExceeded (exit 5) iff replayed capacity exceeds
+    # FACTOR * allowed capacity — formula pinned in §8 (backtest CLI).
+    # Message names actual, allowed, factor, and budget type.
     # gates.max_residual_risk (None -> no gate)
 ```
 
@@ -524,9 +550,15 @@ Pinned semantics:
    output so determinism tests can strip it
    (`<p id="created-at">…</p>`).
 2. **Chain verification before rendering** (`ContractViolation` on failure,
-   naming both hashes): `policy.input_sha256s.calibrator ==
-   content_hash(calibrator_dict)`; and if `backtest_dict` is given:
-   `backtest.input_sha256s.policy == policy.policy_hash` AND
+   naming both hashes). Every hash is RECOMPUTED from content, never trusted
+   as declared (declared-vs-declared comparison would render a tampered
+   artifact as verified):
+   `policy.input_sha256s.calibrator == content_hash(calibrator_dict)`;
+   policy self-check `content_hash(policy_dict) == policy.policy_hash`
+   (same semantics as the backtester's §9.1 self-check); and if
+   `backtest_dict` is given: backtest self-check
+   `content_hash(backtest_dict) == backtest.backtest_hash`,
+   `backtest.input_sha256s.policy == content_hash(policy_dict)` AND
    `backtest.input_sha256s.calibrator == content_hash(calibrator_dict)`.
    The report renders the chain it verified, never an unchecked one.
 3. `backtest_dict=None`: omit the backtest/curves sections and render a
@@ -544,7 +576,18 @@ Pinned semantics:
    grouped bar chart (captured loss: policy / raw_confidence /
    random mean ± std), n_review parity note; (e) coverage-vs-risk — the
    three `curves` series vs `grid`, with a vertical marker at the policy's
-   own budget fraction.
+   own budget fraction; (f) gates — INFORMATIONAL table (see
+   docs/risk-register.md R2): declared thresholds from
+   `policy.config_snapshot.gates` vs measured values, verdict PASS/FAIL
+   using the same strict `>` comparison as the CLI gates, "not set" for
+   null/absent gates. Rows: `max_ece` vs `calibrator.ece_holdout`;
+   `max_residual_risk` vs planned `policy.totals.expected_residual_loss`;
+   `max_residual_risk` vs realized `strategies.policy.residual_loss`
+   (backtest only); budget adherence (backtest only, always informational,
+   no verdict): planned `policy.totals.n_review` vs replayed
+   `strategies.policy.n_review` with the replayed/planned ratio ("—" if
+   planned is 0). Purely display — the report still exits non-zero only on
+   contract violations ("no gates beyond exit 1" stands).
 5. **Plotly determinism**: every figure gets an EXPLICIT `div_id`
    (`"fig-reliability"`, `"fig-backtest"`, `"fig-coverage"`); fragments via
    `to_html(full_html=False, include_plotlyjs=False)` except the FIRST

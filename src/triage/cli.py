@@ -19,7 +19,12 @@ from triage import report as report_module
 from triage import synth as synth_module
 from triage.calibration import Calibrator
 from triage.costs import Budget, CostModel
-from triage.exceptions import CalibrationGateFailed, ContractViolation, ResidualRiskExceeded
+from triage.exceptions import (
+    BudgetOverrunExceeded,
+    CalibrationGateFailed,
+    ContractViolation,
+    ResidualRiskExceeded,
+)
 
 app = typer.Typer()
 
@@ -152,6 +157,12 @@ def backtest(
         "-o",
         help="Output path for backtest.json",
     ),
+    max_budget_overrun: float | None = typer.Option(
+        None,
+        "--max-budget-overrun",
+        help="Fail (exit 5) if replayed review capacity exceeds this factor times the "
+        "budget's allowed capacity on this history. Float >= 1.0. No default (no gate).",
+    ),
 ) -> None:
     """Replay a policy against labeled history and compare it to baselines."""
     try:
@@ -213,6 +224,7 @@ def backtest(
     except ValidationError as e:
         raise ContractViolation(f"policy.config_snapshot failed validation: {e}") from e
     backtest_module.check_realized_residual_gate(result, cost_model)
+    backtest_module.check_budget_overrun_gate(result, cost_model, max_budget_overrun)
 
     policy_strategy = result.strategies["policy"]
     typer.echo(
@@ -295,6 +307,7 @@ def app_main() -> None:
     - ContractViolation -> 1
     - ResidualRiskExceeded -> 2
     - CalibrationGateFailed -> 3
+    - BudgetOverrunExceeded -> 5
     - Other exceptions -> 4
     - Success -> 0
     """
@@ -309,6 +322,9 @@ def app_main() -> None:
     except CalibrationGateFailed as e:
         typer.echo(f"Error: {e}", err=True)
         sys.exit(3)
+    except BudgetOverrunExceeded as e:
+        typer.echo(f"Error: {e}", err=True)
+        sys.exit(5)
     except typer.Exit as e:
         sys.exit(e.exit_code)
     except ClickException as e:

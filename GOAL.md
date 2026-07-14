@@ -110,6 +110,14 @@ not trusted. Realized residual loss is gated by `gates.max_residual_risk`
 (exit 2): `plan` can pass on expected numbers while `backtest` fails on
 realized ones, which is exactly the drift alarm.
 
+Threshold replay can review more items than planned when ties sit exactly at
+a threshold (expected and correct, see docs/interfaces.md §9.4). Because
+capacity is the resource being allocated, `backtest` accepts an optional
+`--max-budget-overrun FACTOR` (float ≥ 1.0): if the replayed review
+count/spend exceeds FACTOR × the budget's capacity on this history, exit
+code 5. The replay itself is never capped — the gate only refuses to bless
+the result. See docs/risk-register.md (R1).
+
 ### 5. Report (`report`)
 
 Static HTML (jinja2 + plotly): reliability diagrams, coverage-vs-risk curves,
@@ -139,7 +147,8 @@ triage synth --scenario overconfident --seed 42 -o data/
 ```
 
 Exit codes (public API, see CLAUDE.md): 0 OK, 1 contract violation,
-2 residual risk gate failed, 3 calibration gate failed, 4 internal error.
+2 residual risk gate failed, 3 calibration gate failed, 4 internal error,
+5 budget overrun gate failed (`backtest --max-budget-overrun`).
 `plan` and `backtest` are designed to run inside CI as gates.
 
 ## Phases

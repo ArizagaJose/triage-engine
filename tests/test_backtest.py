@@ -12,9 +12,14 @@ import polars as pl
 import pytest
 
 from triage.artifacts import content_hash
-from triage.backtest import BacktestResult, check_realized_residual_gate, run
+from triage.backtest import (
+    BacktestResult,
+    check_budget_overrun_gate,
+    check_realized_residual_gate,
+    run,
+)
 from triage.costs import Budget, CostModel, Gates, SegmentCosts
-from triage.exceptions import ContractViolation, ResidualRiskExceeded
+from triage.exceptions import BudgetOverrunExceeded, ContractViolation, ResidualRiskExceeded
 
 
 class IdentityCalibrator:
@@ -385,6 +390,81 @@ class TestResidualGate:
             segments={"segA": SegmentCosts(false_accept_cost=100.0, review_cost=10.0)},
         )
         check_realized_residual_gate(result, cost_model)  # does not raise
+
+
+class TestBudgetOverrunGate:
+    def test_none_is_noop(self) -> None:
+        result = _run_main()
+        cost_model = CostModel(
+            budget=Budget(type="fraction", value=0.0001),
+            segments={"segA": SegmentCosts(false_accept_cost=100.0, review_cost=10.0)},
+        )
+        check_budget_overrun_gate(result, cost_model, None)  # does not raise
+
+    def test_factor_below_one_raises_contract_violation(self) -> None:
+        result = _run_main()
+        cost_model = CostModel(
+            budget=Budget(type="fraction", value=0.1),
+            segments={"segA": SegmentCosts(false_accept_cost=100.0, review_cost=10.0)},
+        )
+        with pytest.raises(ContractViolation):
+            check_budget_overrun_gate(result, cost_model, 0.5)
+
+    def test_fraction_budget_raises_just_above_factor(self) -> None:
+        # n_history=5, n_review=2; value=0.2 -> allowed=1.0; factor=1.9 -> threshold=1.9 < 2.
+        result = _run_main()
+        cost_model = CostModel(
+            budget=Budget(type="fraction", value=0.2),
+            segments={"segA": SegmentCosts(false_accept_cost=100.0, review_cost=10.0)},
+        )
+        with pytest.raises(BudgetOverrunExceeded):
+            check_budget_overrun_gate(result, cost_model, 1.9)
+
+    def test_fraction_budget_passes_at_exact_factor(self) -> None:
+        # value=0.2 -> allowed=1.0; factor=2.0 -> threshold=2.0 == actual (strict >, so passes).
+        result = _run_main()
+        cost_model = CostModel(
+            budget=Budget(type="fraction", value=0.2),
+            segments={"segA": SegmentCosts(false_accept_cost=100.0, review_cost=10.0)},
+        )
+        check_budget_overrun_gate(result, cost_model, 2.0)  # does not raise
+
+    def test_count_budget_raises_when_over(self) -> None:
+        # value=1 -> allowed=1; factor=1.9 -> threshold=1.9 < actual n_review=2.
+        result = _run_main()
+        cost_model = CostModel(
+            budget=Budget(type="count", value=1),
+            segments={"segA": SegmentCosts(false_accept_cost=100.0, review_cost=10.0)},
+        )
+        with pytest.raises(BudgetOverrunExceeded):
+            check_budget_overrun_gate(result, cost_model, 1.9)
+
+    def test_count_budget_passes_within_factor(self) -> None:
+        result = _run_main()
+        cost_model = CostModel(
+            budget=Budget(type="count", value=1),
+            segments={"segA": SegmentCosts(false_accept_cost=100.0, review_cost=10.0)},
+        )
+        check_budget_overrun_gate(result, cost_model, 2.0)  # does not raise
+
+    def test_money_budget_compares_review_spend(self) -> None:
+        # review_spend = 20.0 (a1, a3 at review_cost=10 each); value=10 -> allowed=10;
+        # factor=1.9 -> threshold=19 < 20.
+        result = _run_main()
+        cost_model = CostModel(
+            budget=Budget(type="money", value=10.0),
+            segments={"segA": SegmentCosts(false_accept_cost=100.0, review_cost=10.0)},
+        )
+        with pytest.raises(BudgetOverrunExceeded):
+            check_budget_overrun_gate(result, cost_model, 1.9)
+
+    def test_money_budget_passes_at_exact_factor(self) -> None:
+        result = _run_main()
+        cost_model = CostModel(
+            budget=Budget(type="money", value=10.0),
+            segments={"segA": SegmentCosts(false_accept_cost=100.0, review_cost=10.0)},
+        )
+        check_budget_overrun_gate(result, cost_model, 2.0)  # does not raise
 
 
 class TestToDict:

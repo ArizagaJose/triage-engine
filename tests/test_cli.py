@@ -339,6 +339,123 @@ def test_plan_residual_gate_exit_2_artifact_still_written(
     assert "policy_hash" in data
 
 
+# --- backtest ---
+
+
+def test_backtest_success_no_gate(
+    session_tmp: Path,
+    synth_data: tuple[Path, subprocess.CompletedProcess[str]],
+    calibrator_path: Path,
+    policy_path: Path,
+) -> None:
+    """No --max-budget-overrun flag -> behavior unchanged, exit 0."""
+    data_dir, _ = synth_data
+    out_path = session_tmp / "backtest_no_gate.json"
+    result = run_cli(
+        [
+            "backtest",
+            "--policy",
+            str(policy_path),
+            "--calibrator",
+            str(calibrator_path),
+            "--history",
+            str(data_dir / "batch.parquet"),
+            "-o",
+            str(out_path),
+        ]
+    )
+    assert result.returncode == 0, result.stderr
+    assert out_path.exists()
+    data = json.loads(out_path.read_text())
+    assert data["strategies"]["policy"]["n_review"] == 1183
+
+
+def test_backtest_budget_overrun_gate_trips(
+    session_tmp: Path,
+    synth_data: tuple[Path, subprocess.CompletedProcess[str]],
+    calibrator_path: Path,
+    policy_path: Path,
+) -> None:
+    """budget.value=0.10 * n_history=10000 -> allowed=1000; replayed n_review=1183.
+
+    factor=1.0 -> threshold=1000 < 1183 -> exit 5, but backtest.json is still written.
+    """
+    data_dir, _ = synth_data
+    out_path = session_tmp / "backtest_overrun.json"
+    result = run_cli(
+        [
+            "backtest",
+            "--policy",
+            str(policy_path),
+            "--calibrator",
+            str(calibrator_path),
+            "--history",
+            str(data_dir / "batch.parquet"),
+            "--max-budget-overrun",
+            "1.0",
+            "-o",
+            str(out_path),
+        ]
+    )
+    assert result.returncode == 5, result.stderr
+    assert out_path.exists()
+    data = json.loads(out_path.read_text())
+    assert data["strategies"]["policy"]["n_review"] == 1183
+
+
+def test_backtest_budget_overrun_gate_generous_factor_passes(
+    session_tmp: Path,
+    synth_data: tuple[Path, subprocess.CompletedProcess[str]],
+    calibrator_path: Path,
+    policy_path: Path,
+) -> None:
+    data_dir, _ = synth_data
+    out_path = session_tmp / "backtest_overrun_ok.json"
+    result = run_cli(
+        [
+            "backtest",
+            "--policy",
+            str(policy_path),
+            "--calibrator",
+            str(calibrator_path),
+            "--history",
+            str(data_dir / "batch.parquet"),
+            "--max-budget-overrun",
+            "3.0",
+            "-o",
+            str(out_path),
+        ]
+    )
+    assert result.returncode == 0, result.stderr
+    assert out_path.exists()
+
+
+def test_backtest_budget_overrun_factor_below_one_exit_1(
+    session_tmp: Path,
+    synth_data: tuple[Path, subprocess.CompletedProcess[str]],
+    calibrator_path: Path,
+    policy_path: Path,
+) -> None:
+    data_dir, _ = synth_data
+    out_path = session_tmp / "backtest_overrun_bad_factor.json"
+    result = run_cli(
+        [
+            "backtest",
+            "--policy",
+            str(policy_path),
+            "--calibrator",
+            str(calibrator_path),
+            "--history",
+            str(data_dir / "batch.parquet"),
+            "--max-budget-overrun",
+            "0.5",
+            "-o",
+            str(out_path),
+        ]
+    )
+    assert result.returncode == 1, result.stderr
+
+
 # --- determinism ---
 
 
