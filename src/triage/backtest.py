@@ -350,8 +350,13 @@ def check_budget_overrun_gate(
     """Raise BudgetOverrunExceeded if replayed capacity exceeds --max-budget-overrun."""
     if max_budget_overrun is None:
         return
-    if max_budget_overrun < 1.0:
-        raise ContractViolation(f"--max-budget-overrun must be >= 1.0, got {max_budget_overrun}")
+    # NaN/inf must be rejected explicitly: `nan < 1.0` is False, and both
+    # `actual > nan` and `actual > inf` are False, so a non-finite factor
+    # would silently disable the gate instead of gating.
+    if not math.isfinite(max_budget_overrun) or max_budget_overrun < 1.0:
+        raise ContractViolation(
+            f"--max-budget-overrun must be a finite float >= 1.0, got {max_budget_overrun}"
+        )
     budget = cost_model.budget
     policy_strategy = result.strategies["policy"]
     if budget.type == "fraction":

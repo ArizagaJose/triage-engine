@@ -410,6 +410,19 @@ class TestBudgetOverrunGate:
         with pytest.raises(ContractViolation):
             check_budget_overrun_gate(result, cost_model, 0.5)
 
+    @pytest.mark.parametrize("factor", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_factor_raises_contract_violation(self, factor: float) -> None:
+        # nan < 1.0 is False and `actual > nan` / `actual > inf` are False,
+        # so without an explicit isfinite check the gate would be silently
+        # disabled rather than rejected.
+        result = _run_main()
+        cost_model = CostModel(
+            budget=Budget(type="fraction", value=0.1),
+            segments={"segA": SegmentCosts(false_accept_cost=100.0, review_cost=10.0)},
+        )
+        with pytest.raises(ContractViolation, match="finite"):
+            check_budget_overrun_gate(result, cost_model, factor)
+
     def test_fraction_budget_raises_just_above_factor(self) -> None:
         # n_history=5, n_review=2; value=0.2 -> allowed=1.0; factor=1.9 -> threshold=1.9 < 2.
         result = _run_main()

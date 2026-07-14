@@ -356,8 +356,11 @@ triage backtest --policy artifacts/policy.json --calibrator artifacts/calibrator
   overrun gate, exit 5 (`BudgetOverrunExceeded`). Deliberately a CLI flag,
   NOT a `gates:` YAML field — a new `Gates` field would change
   `config_snapshot` in every policy.json and hence every `policy_hash`,
-  breaking golden artifacts (see docs/risk-register.md R1). `FACTOR < 1.0`
-  is a `ContractViolation` (exit 1). Pinned formula, from the policy's
+  breaking golden artifacts (see docs/risk-register.md R1). A non-finite
+  FACTOR (NaN/inf — float parsers accept these spellings) or `FACTOR < 1.0`
+  is a `ContractViolation` (exit 1); NaN in particular would otherwise
+  silently disable the gate (`nan < 1.0` and `actual > nan` are both
+  False). Pinned formula, from the policy's
   `config_snapshot.budget` applied to THIS history: allowed capacity =
   `value * n_history` (fraction, un-floored) or `value` (count), compared
   against replayed `strategies.policy.n_review`; for money budgets,
@@ -436,7 +439,8 @@ def check_realized_residual_gate(result: BacktestResult,
 
 def check_budget_overrun_gate(result: BacktestResult, cost_model: CostModel,
                               max_budget_overrun: float | None) -> None
-    # None -> no-op. FACTOR < 1.0 -> ContractViolation. Otherwise raises
+    # None -> no-op. Non-finite or < 1.0 FACTOR -> ContractViolation.
+    # Otherwise raises
     # BudgetOverrunExceeded (exit 5) iff replayed capacity exceeds
     # FACTOR * allowed capacity — formula pinned in §8 (backtest CLI).
     # Message names actual, allowed, factor, and budget type.
