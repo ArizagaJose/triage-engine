@@ -62,6 +62,15 @@ Accepts `.parquet` or `.csv` (CSV read with `try_parse_dates=False`, all
 columns as declared types via explicit `schema_overrides`; a CSV whose values
 can't parse as those types is a `ContractViolation`, not a crash).
 
+```python
+def validate_seed(seed: int) -> None
+```
+
+Seeds feed `np.random.default_rng`, which only accepts non-negative
+integers. `validate_seed` raises `ContractViolation` (exit 1) for anything
+else. It is called by `synth.generate`, `calibration.fit` and `backtest.run`,
+and by the CLI preflights (§8). A negative `--seed` used to be exit 4.
+
 ## 3. Cost model (`src/triage/costs.py`)
 
 Pydantic v2 models, strict (`model_config = ConfigDict(extra="forbid")`):
@@ -69,15 +78,16 @@ Pydantic v2 models, strict (`model_config = ConfigDict(extra="forbid")`):
 ```python
 class Budget(BaseModel):
     type: Literal["fraction", "count", "money"]
-    value: float                      # > 0; if fraction: <= 1.0
+    value: float                      # finite, > 0; if fraction: <= 1.0
 
 class Gates(BaseModel):
-    max_residual_risk: float | None = None   # >= 0
-    max_ece: float | None = None             # in (0, 1]
+    max_residual_risk: float | None = None   # >= 0 (NaN rejected; inf = never fails)
+    max_ece: float | None = None             # in (0, 1]; NaN rejected
+    ece_gate_mode: Literal["point", "ci_upper"] = "point"   # see §4 Gate
 
 class SegmentCosts(BaseModel):
-    false_accept_cost: float          # >= 0
-    review_cost: float                # >= 0
+    false_accept_cost: float          # finite, >= 0
+    review_cost: float                # finite, >= 0
 
 class CostModel(BaseModel):
     budget: Budget
@@ -95,6 +105,28 @@ def load(path: Path) -> CostModel
 YAML parse errors and pydantic `ValidationError`s are wrapped into
 `ContractViolation` with a readable message. The exact YAML shape is the
 example in GOAL.md.
+
+Non-finite numbers: every numeric field is validated with a check NaN
+cannot pass (NaN fails every comparison). Otherwise NaN/inf either crashed
+later with exit 4 (a budget in `floor()`/`int()`, or a cost in the JSON
+writer, which forbids NaN/inf) or silently disabled a gate
+(`max_residual_risk`, `max_ece`). All of these are `ContractViolation`
+(exit 1), whether they come from the YAML, `plan --budget`, or `run`'s
+overrides.
+
+`Gates` pinned rules (v1.x, docs/risk-register.md R3):
+
+- `max_ece` is validated as `0 < max_ece <= 1`, so NaN is rejected. A NaN
+  threshold would otherwise pass validation and silently disable the gate.
+- `ece_gate_mode` other than `"point"` with `max_ece` null/absent is a
+  validation error. A stricter mode with no threshold gates nothing.
+- **Serialization**: `Gates.model_dump()` OMITS `ece_gate_mode` when it
+  equals the default `"point"`. `policy.config_snapshot` is
+  `CostModel.model_dump()` and feeds `policy_hash`, so default-mode
+  snapshots stay byte-identical to those written before the field existed.
+  Every existing `policy_hash` and the committed golden fixtures are
+  unchanged. An absent key reads back as `"point"`. A non-default mode is
+  always present in the snapshot.
 
 ## 4. Calibration (`src/triage/calibration.py`)
 
@@ -162,8 +194,21 @@ Pinned algorithm details:
   using `np.random.default_rng(seed + 1)`, recompute ECE of the selected
   calibrator's predictions, take percentile CI (`(1-ci_level)/2` on each side).
 - **Gate**: `fit` does NOT gate. A separate helper
-  `check_ece_gate(calibrator, max_ece: float) -> None` raises
-  `CalibrationGateFailed` if `ece_holdout > max_ece`.
+  `check_ece_gate(calibrator, max_ece: float, mode: str = "point") -> None`
+  raises `CalibrationGateFailed` (exit 3) if the gated statistic is
+  `> max_ece` (strict: equality passes). The statistic is chosen by the mode:
+  - `"point"` (default, the original semantics): `ece_holdout`.
+  - `"ci_upper"` (v1.x, opt-in): `ece_ci[1]`, the upper bound of the
+    bootstrap CI above (at `config.ci_level`, default 95%). It tightens
+    automatically as the holdout shrinks (risk-register R3).
+
+  An unknown mode raises `ContractViolation` (exit 1). `ece_gate_statistic(
+  calibrator, mode) -> EceGateStatistic(name, description, value)` exposes
+  the checked value for messages. The failure message names the mode, the
+  checked field and value, `max_ece`, and, for context, `ece_holdout` and
+  `ece_ci`. The mode is a gate option, not a calibration output, so it is
+  NOT serialized into `calibrator.json`. The calibrator's `content_hash`
+  (and every `policy_hash` built on it) is independent of how it was gated.
 
 Serialization (`params`): isotonic → `{"x_thresholds": [...], "y_thresholds": [...]}`;
 platt → `{"a": float, "b": float}`.
@@ -295,7 +340,8 @@ def utc_now_iso() -> str      # timezone-aware UTC, seconds precision
 `params`, `reliability_bins`, `seed`, `tool_version`.
 
 **policy.json** top-level keys: `budget` (as declared in YAML),
-`config_snapshot` (the full cost YAML as parsed), `created_at`,
+`config_snapshot` (the full cost YAML as parsed; `gates.ece_gate_mode` is
+present only when non-default, see §3), `created_at`,
 `input_sha256s` (`{batch, calibrator, costs}`), `policy_hash`, `segments`
 (name → `{expected_captured_loss, expected_residual_loss, n_review, n_total,
 p_error_threshold}`), `tool_version`, `totals` (`{expected_captured_loss,
@@ -326,7 +372,8 @@ Typer app, entry point `triage` (pyproject `[project.scripts]`).
 
 ```
 triage synth --scenario overconfident --seed 42 -o data/
-triage calibrate --golden data/golden.parquet --seed 42 [--max-ece F] -o artifacts/calibrator.json
+triage calibrate --golden data/golden.parquet --seed 42 [--max-ece F] \
+            [--ece-gate-mode point|ci_upper] -o artifacts/calibrator.json
 triage plan --batch data/batch.parquet --calibrator artifacts/calibrator.json \
             --costs costs.yaml [--budget F] -o artifacts/policy.json
 triage backtest --policy artifacts/policy.json --calibrator artifacts/calibrator.json \
@@ -387,15 +434,36 @@ triage report --from artifacts/ -o report.html
   `write_artifact` does), and prints a one-line summary (which artifacts
   were included + output path). No gates beyond exit 1.
 
+- **Option preflights (single source of option validation).** Each
+  command validates its options in ONE function, called before it reads or
+  writes anything: `_synth_preflight` (scenario name via
+  `synth.validate_scenario`, seed), `_calibrate_preflight` (seed, and the
+  gate flags via `costs.Gates`), and `_backtest_preflight` (seed,
+  `backtest.validate_n_random_draws`, `backtest.validate_max_budget_overrun`).
+  `run` calls the same preflights with the exact arguments it later passes to
+  each stage. So `run` and the individual commands accept and reject exactly
+  the same inputs, with the same messages. `plan --budget` is validated by
+  `costs.Budget` in both paths. Consequence for `backtest`: an invalid
+  `--max-budget-overrun`, `--n-random-draws` or `--seed` is now rejected
+  before the replay runs, so no `backtest.json` is written for it.
 - `--seed` is required-explicit where randomness exists (`synth`, `calibrate`);
   no hidden defaults (typer default allowed but must be a literal, documented).
   Pin: default `--seed 42` on both, shown in help.
 - `--budget` (plan) overrides `budget.value` from the YAML, keeping
   `budget.type`.
-- `calibrate` gating: if `--max-ece` given, run `check_ece_gate` (exit 3) —
-  artifact is written first.
+- `calibrate` gating: if `--max-ece` given, run `check_ece_gate` with
+  `--ece-gate-mode` (default `point`) (exit 3). The artifact is written
+  first. The two flags are validated BEFORE fitting, using the same
+  `costs.Gates` rules as the YAML (§3): `--max-ece` in `(0, 1]` (NaN
+  rejected), mode in {`point`, `ci_upper`}, and `ci_upper` requires
+  `--max-ece`. A violation is exit 1 and nothing is written. On success with
+  a gate, the summary line appends
+  `ece_gate=<mode> <checked field>=<value><=max_ece=<threshold>`.
 - `plan` gating order: write policy.json, then `check_ece_gate` against
-  `gates.max_ece` from the YAML (exit 3), then `check_residual_gate` (exit 2).
+  `gates.max_ece` with `gates.ece_gate_mode` from the YAML (exit 3), then
+  `check_residual_gate` (exit 2). `plan` has no `--ece-gate-mode` flag. The
+  YAML is the single source, so the mode that was checked is exactly the
+  one recorded in `config_snapshot`.
 - `plan`'s `input_sha256s`: `batch` and `costs` are `file_sha256` of raw
   bytes; `calibrator` is `content_hash` of the PARSED artifact dict
   (semantic hash, `created_at` excluded). The calibrator file embeds its own
@@ -413,6 +481,62 @@ triage report --from artifacts/ -o report.html
   violation, and click's default usage-error code 2 would collide with the
   residual-risk gate meaning. `app_main` uses `sys.exit`, never `typer.Exit`
   outside the runner (it is not honored there).
+
+### `run` — the whole chain in one command (v1.x)
+
+```
+triage run (--scenario S | --golden G --batch B --costs C [--history H]) [--seed 42]
+           [--budget F] [--max-ece F] [--ece-gate-mode point|ci_upper]
+           [--max-residual-risk F] [--max-budget-overrun F] [--n-random-draws 200]
+           [--fail-fast] -o RUN_DIR
+```
+
+Pinned behavior:
+
+- **Same code, same artifacts.** `run` calls the `synth`, `calibrate`,
+  `plan`, `backtest`, and `report` command functions in that order. It adds
+  no semantics of its own. Its artifacts equal the manual chain's (minus
+  `created_at`). The golden fixtures (test-spec B/E) are reproduced by
+  `run --scenario well_calibrated --seed 7`.
+- **Modes** (exactly one): synthetic (`--scenario`, data written to
+  `RUN_DIR/data/`, the labeled batch doubles as history), or own-data
+  (`--golden --batch --costs`, optional `--history`; no history ⇒ no
+  backtest stage, report without backtest). `--seed` seeds every randomized
+  stage (synth, calibrate, backtest random baseline).
+- **Layout**: `RUN_DIR/costs.yaml` (the effective cost model `plan` reads),
+  `RUN_DIR/artifacts/{calibrator,policy,backtest}.json`,
+  `RUN_DIR/report.html`, plus `RUN_DIR/data/` in synthetic mode.
+- **Overrides** `--budget`, `--max-ece`, `--ece-gate-mode`,
+  `--max-residual-risk` patch the source YAML's `budget.value` / `gates.*`.
+  The result is validated as a `CostModel` and written to
+  `RUN_DIR/costs.yaml` (sorted keys). Without overrides the source bytes are
+  copied verbatim, so `input_sha256s.costs` equals the source file's hash.
+  The calibrate stage is gated with the effective `gates.max_ece` /
+  `gates.ece_gate_mode` (no gate if `max_ece` is null).
+  `--max-budget-overrun` and `--n-random-draws` pass through to `backtest`.
+- **Validation before any write** (exit 1, nothing written or removed):
+  the stage preflights above (synth, calibrate with the effective gates, and
+  backtest), plus run-only rules: mode exclusivity/completeness, input files
+  exist, overrides valid as a `CostModel`, `--max-budget-overrun` only with
+  a history, `RUN_DIR` not a file, and no input path equal to a file `run`
+  writes.
+- **No silent drift from the commands**: `run` refuses (internal error) to
+  call a stage whose parameter set differs from the arguments it passes. A
+  command option that `run` does not forward therefore fails loudly instead
+  of receiving typer's placeholder default. `tests/cli/test_run.py` pins
+  this at three levels: signatures, validation parity (same exit code and
+  message for every shared invalid option), and execution parity (manual
+  chain vs `run`: per-stage exit codes, gate messages, artifacts, report).
+- **Stale outputs**: after validation, the files `run` writes (the layout
+  above) are deleted if present. Other files in `RUN_DIR` are untouched.
+- **Gates**: a stage's gate exception (exit 2/3/5) is recorded, and the run
+  continues (artifact-first, so every artifact and the report exist). At the
+  end, `run` prints a one-line summary (`run: <stage>=ok|FAIL(exit N) ...`)
+  and raises the FIRST failure's exception type (stage order: calibrate,
+  plan, backtest), so `app_main` exits with that code. `--fail-fast`
+  re-raises the first gate failure immediately (later stages do not run).
+  `ContractViolation` / internal errors always stop immediately (exit 1 / 4).
+  No new exit codes.
 
 ## 9. Backtester (`src/triage/backtest.py`) — v1
 
@@ -436,6 +560,13 @@ def run(policy_dict: dict[str, Any], calibrator: PredictsErrors,
 def check_realized_residual_gate(result: BacktestResult,
                                  cost_model: CostModel) -> None
     # raises ResidualRiskExceeded if strategies.policy.residual_loss >
+
+def validate_n_random_draws(n_random_draws: int) -> None
+    # int >= 0, else ContractViolation (called by run() and the CLI
+    # preflight; a negative count used to crash in numpy, exit 4)
+
+def validate_max_budget_overrun(max_budget_overrun: float) -> None
+    # finite and >= 1.0, else ContractViolation
 
 def check_budget_overrun_gate(result: BacktestResult, cost_model: CostModel,
                               max_budget_overrun: float | None) -> None
@@ -534,11 +665,19 @@ Pinned semantics (do not improvise):
       to different questions; measured at seed 42, overconfident:
       curve 0.4420 at f=0.10 vs capture_rate 0.5029 at 1183 replayed items.
 
-## 11. Report (`src/triage/report.py`) — v1
+## 11. Report (`src/triage/report.py`) — v1.1 (redesign)
 
-Static, self-contained HTML: reliability diagrams, coverage-vs-risk curves,
-policy summary, backtest comparison, artifact hash chain. jinja2 + plotly
-only; NO network resources at render OR view time (plotly.js embedded).
+Revised for the report redesign ("Briefing" layout with CI-style checks; the
+design exploration lives outside the repo in `report-mockups/`). This section
+supersedes the v1 §11. What changed and why is listed in §11.12. Artifact
+schemas (§7, §9) are **unchanged**: everything below is derivable from the
+existing calibrator / policy / backtest JSON. No version bump.
+
+Static, self-contained HTML. Audience: operations people (read the first
+screen, act on the status) and the team's ML tech lead (drills into the
+evidence). Guiding rule: **the answer first, the evidence second, the audit
+trail last.** jinja2 + plotly only; NO network resources at render OR view
+time (plotly.js embedded, no web fonts, no external stylesheets/images).
 
 ```python
 def render(calibrator_dict: dict[str, Any], policy_dict: dict[str, Any],
@@ -546,67 +685,269 @@ def render(calibrator_dict: dict[str, Any], policy_dict: dict[str, Any],
            tool_version: str) -> str
 ```
 
+Signature, CLI behavior (§8) and exit codes are unchanged.
+
+### 11.1 Purity
+
+`render` is a PURE function of its arguments: byte-identical HTML for
+identical inputs. All variance is injected via `created_at` (the CLI passes
+`utc_now_iso()`), which appears on exactly one line of the output, exactly
+as `<p id="created-at" class="meta">{created_at}</p>`, so determinism tests
+can strip it. No wall-clock, locale, or dict-iteration-order dependence
+anywhere (all iteration over artifact dicts goes through explicit sorts).
+
+### 11.2 Chain verification before rendering
+
+Unchanged from v1: `ContractViolation` on failure, naming both hashes. Every
+hash is RECOMPUTED from content, never trusted as declared:
+`policy.input_sha256s.calibrator == content_hash(calibrator_dict)`; policy
+self-check `content_hash(policy_dict) == policy.policy_hash`; and if
+`backtest_dict` is given: backtest self-check
+`content_hash(backtest_dict) == backtest.backtest_hash`,
+`backtest.input_sha256s.policy == content_hash(policy_dict)` AND
+`backtest.input_sha256s.calibrator == content_hash(calibrator_dict)`. The
+report renders the chain it verified, never an unchecked one; it therefore
+always shows an "artifact chain verified" badge in the header.
+
+### 11.3 Modes
+
+- **full** (`backtest_dict` given): all sections.
+- **plan_only** (`backtest_dict is None`): the results section and the
+  backtest-only figures (`fig-backtest`, `fig-coverage`, `fig-segments`) are
+  omitted and a visible note is rendered in their place. The note contains
+  the phrase "backtest not run" (case-insensitive). That phrase appears
+  NOWHERE in a full-mode report, including check copy.
+
+### 11.4 Page structure (document order is pinned)
+
+The root `<main>` carries `data-status="ok|attention|failed"` and
+`data-mode="full|plan_only"` (§11.6). Sections, in this order:
+
+| # | element / id | content |
+|---|--------------|---------|
+| 0 | `<header>` | Brand + title, `tool_version`, the `created-at` line (§11.1), "artifact chain verified" badge. Nothing else: no tables, no figures. |
+| 1 | `section#at-a-glance` | **The first content section; nothing may precede it except the header.** Status badge, headline (`<h1>`), lede paragraph, four KPI tiles (§11.7), checks list (§11.5). Contains no figures and no plotly.js. |
+| 2 | `section#results` (full only) | "Is the policy worth it?": `fig-backtest`, `fig-coverage`, strategy table (policy / raw confidence / random mean ± std: loss caught, residual loss, n_review, review spend, efficiency, capture rate), the n_review parity note (all strategies review the same count), and a tie-inflation note whenever replayed `n_review` ≠ planned (explains why the table's capture rate can differ from the curve at the budget point, §9.4/§9.11). In plan_only this slot holds the "backtest not run" note (§11.3). |
+| 3 | `section#segments` | "Where the risk is": `fig-segments` (full only) + per-segment table (§11.8). |
+| 4 | `section#calibration` | "Can we trust the model's probabilities?": `fig-reliability`; method, seed, `n_golden`, ECE raw → calibrated, bootstrap CI labelled with `config.ci_level`. |
+| 5 | `section#gates` | Heading text "Gates". The INFORMATIONAL gates table (§11.9). |
+| 6 | `section#audit` | Audit trail in a `<details>` element, CLOSED by default. The `<summary>` shows the short chain (calibrator → policy → backtest, first 10 hex chars each); the body holds the full hash table: calibrator `content_hash`, `policy_hash`, `backtest_hash` if present, plus each artifact's recorded `input_sha256s`. Full hashes are always present in the DOM. |
+
+Footer: one line stating that cost figures are in the units declared in
+costs.yaml ("cost units" everywhere in copy; no currency symbol).
+
+**plotly.js placement**: embedded exactly once, as a standalone inline
+`<script>` holding `plotly.offline.get_plotlyjs()`, placed AFTER
+`section#at-a-glance` and BEFORE the first figure. So the first screen
+renders without waiting for the ~4.6 MB bundle to parse. Every figure is
+produced with `to_html(full_html=False, include_plotlyjs=False)` and an
+explicit `div_id` (§11.10). Never `include_plotlyjs="cdn"`, never a
+`<script src=…>`.
+
+### 11.5 Summary model and checks
+
+A pure helper builds everything the at-a-glance section shows:
+
+```python
+def _build_summary(calibrator_dict: dict[str, Any], policy_dict: dict[str, Any],
+                   backtest_dict: dict[str, Any] | None) -> Summary
+
+@dataclass(frozen=True)
+class Check:
+    id: str                 # stable id from the catalogue below
+    severity: Literal["fail", "warn", "info", "pass"]
+    title: str              # plain text, one line (ops language)
+    detail: str             # plain text, 1-2 sentences (may name the technical field)
+    value: str              # short plain-text figure shown right-aligned
+    section: str            # id of the evidence section ("gates", "segments", …)
+    params: dict[str, float | int | str | None]   # raw numbers behind the copy
+
+@dataclass(frozen=True)
+class Summary:
+    status: Literal["ok", "attention", "failed"]
+    mode: Literal["full", "plan_only"]
+    checks: tuple[Check, ...]   # ordered, see below
+    kpis: dict[str, Any]        # §11.7
+```
+
 Pinned semantics:
 
-1. `render` is a PURE function of its arguments — byte-identical HTML for
-   identical inputs. All variance is injected via `created_at` (the CLI
-   passes `utc_now_iso()`), which must appear on exactly one line of the
-   output so determinism tests can strip it
-   (`<p id="created-at">…</p>`).
-2. **Chain verification before rendering** (`ContractViolation` on failure,
-   naming both hashes). Every hash is RECOMPUTED from content, never trusted
-   as declared (declared-vs-declared comparison would render a tampered
-   artifact as verified):
-   `policy.input_sha256s.calibrator == content_hash(calibrator_dict)`;
-   policy self-check `content_hash(policy_dict) == policy.policy_hash`
-   (same semantics as the backtester's §9.1 self-check); and if
-   `backtest_dict` is given: backtest self-check
-   `content_hash(backtest_dict) == backtest.backtest_hash`,
-   `backtest.input_sha256s.policy == content_hash(policy_dict)` AND
-   `backtest.input_sha256s.calibrator == content_hash(calibrator_dict)`.
-   The report renders the chain it verified, never an unchecked one.
-3. `backtest_dict=None`: omit the backtest/curves sections and render a
-   visible note ("backtest not run") — plan-only pipelines still get a
-   report.
-4. Sections: (a) header with tool version, created_at, and the hash table
-   (calibrator `content_hash`, `policy_hash`, `backtest_hash` if present,
-   plus each artifact's recorded `input_sha256s`); (b) calibration —
-   before/after reliability diagram from `calibrator.reliability_bins`
-   (skip `count == 0` bins), method, `ece_raw_holdout` vs `ece_holdout`
-   with the bootstrap CI, `n_golden`, seed; (c) policy summary — budget,
-   totals, per-segment table (threshold, n_review/n_total, expected
-   captured/residual); (d) backtest — expected vs realized residual (the
-   drift signal, called out numerically), strategy comparison table and
-   grouped bar chart (captured loss: policy / raw_confidence /
-   random mean ± std), n_review parity note; (e) coverage-vs-risk — the
-   three `curves` series vs `grid`, with a vertical marker at the policy's
-   own budget fraction; (f) gates — INFORMATIONAL table (see
-   docs/risk-register.md R2): declared thresholds from
-   `policy.config_snapshot.gates` vs measured values, verdict PASS/FAIL
-   using the same strict `>` comparison as the CLI gates, "not set" for
-   null/absent gates. Rows: `max_ece` vs `calibrator.ece_holdout`;
-   `max_residual_risk` vs planned `policy.totals.expected_residual_loss`;
-   `max_residual_risk` vs realized `strategies.policy.residual_loss`
-   (backtest only); budget adherence (backtest only, always informational,
-   no verdict): planned `policy.totals.n_review` vs replayed
-   `strategies.policy.n_review` with the replayed/planned ratio ("—" if
-   planned is 0). Purely display — the report still exits non-zero only on
-   contract violations ("no gates beyond exit 1" stands).
-5. **Plotly determinism**: every figure gets an EXPLICIT `div_id`
-   (`"fig-reliability"`, `"fig-backtest"`, `"fig-coverage"`); fragments via
-   `to_html(full_html=False, include_plotlyjs=False)` except the FIRST
-   rendered figure which uses `include_plotlyjs=True` (embeds plotly.js
-   once). Never `include_plotlyjs="cdn"` (violates local-first at view
-   time).
-6. Template is a package resource: `src/triage/templates/report.html.j2`,
+1. **Plain text only.** `title`, `detail` and `value` are plain strings,
+   autoescaped by the template. Python never builds HTML/`Markup` from
+   artifact-derived data (segment names are attacker-controlled-ish, see the
+   escaping tests). Emphasis, icons and links are the template's job.
+2. **Tests assert on `id`, `severity`, `params`, never on copy.** Wording is
+   owned by the module/template and may change without a spec change.
+3. **Gate checks reuse the gates table's comparison.** Gate verdicts are
+   computed once (the `_gate_row` helper, strict `>`), and both the checks
+   and the gates table (§11.9) read them. The at-a-glance section can never
+   contradict the gates table.
+4. **Status**: `failed` if any check is `fail`; else `attention` if any is
+   `warn`; else `ok`. Red appears ONLY for failed declared gates; amber is
+   the "needs attention" level (drift decision (a): state the ratio
+   neutrally, amber when notable, red only via declared gates).
+5. **Order**: severity (`fail`, `warn`, `info`, `pass`), then catalogue
+   order (the table below). Fully deterministic.
+6. **Rendering**: each check is a `<details class="check">` carrying
+   `data-check-id` and `data-severity`; `fail`/`warn` are rendered `open`
+   (detail visible), `info`/`pass` closed. Each check links to its
+   `section` anchor ("see evidence"). Evidence is NOT duplicated inline:
+   figures appear once, in their section.
+7. Severity is never conveyed by colour alone: every check has an icon
+   glyph (✕ ! i ✓) and a text label.
+
+**Check catalogue** (ids are stable API for tests). `R = 1.25` is the
+module constant `ATTENTION_RESIDUAL_RATIO`: display-only, it never affects
+exit codes; the value is provisional and changing it does not require a
+spec change.
+
+| id | mode | emitted when | severity | `section` |
+|----|------|--------------|----------|-----------|
+| `gate.max_ece` | both | always | `fail` iff the selected statistic (`ece_holdout` for `point`, `ece_ci[1]` for `ci_upper`) exceeds `max_ece`; `pass` otherwise; `info` if `max_ece` is null/absent ("no limit declared") | gates |
+| `gate.max_residual_risk.planned` | both | `max_residual_risk` declared | `fail` iff `policy.totals.expected_residual_loss > max_residual_risk`, else `pass` | gates |
+| `gate.max_residual_risk.realized` | full | `max_residual_risk` declared | `fail` iff `strategies.policy.residual_loss > max_residual_risk`, else `pass` | gates |
+| `gate.max_residual_risk` | both | `max_residual_risk` null/absent | `info` ("no limit declared for unreviewed risk; CI cannot fail on it") | gates |
+| `plan.vs_actual` | full | always | `warn` iff `realized > R × expected` (realized = `strategies.policy.residual_loss`, expected = `backtest.expected.expected_residual_loss`); if `expected == 0`: `warn` iff `realized > 0`; else `pass`. `params`: `expected`, `realized`, `ratio` (null if expected is 0), `worst_segment`, `worst_ratio` | segments |
+| `value.vs_baselines` | full | always | `info` if `total_true_loss == 0` (nothing to catch); else `pass` iff policy `captured_loss` > random `captured_loss_mean` AND > raw-confidence `captured_loss`; else `warn`. `params`: `capture_rate`, `lift_random`, `lift_raw` (null when the baseline denominator is 0) | results |
+| `calibration.vs_raw` | both | always | `pass` iff `ece_holdout <= ece_raw_holdout`, else `info` (calibration did not improve on raw scores) | calibration |
+| `calibration.ci_margin` | both | point mode AND `max_ece` declared AND `ece_holdout <= max_ece < ece_ci[1]` | `info` (passes on the point estimate, but the bootstrap CI upper bound exceeds the gate; see risk-register R3) | calibration |
+| `budget.adherence` | full | always | `pass` iff replayed `strategies.policy.n_review` == planned `policy.totals.n_review`; else `info`. `params`: `planned`, `replayed`, `delta` (replayed − planned), `ratio` (null if planned is 0) | results |
+| `backtest.not_run` | plan_only | always | `info` | results (the plan-only note's slot) |
+
+`worst_segment` = the segment with the largest
+`realized_residual − expected_residual` over the UNION of
+`policy.segments` and `strategies.policy.segments` keys (a missing side
+counts as 0.0; unseen-at-plan-time segments, §9.4, therefore appear with
+expected 0). Ties are broken by segment name ascending. `worst_ratio` is null
+when that segment's expected residual is 0.
+
+Why `calibration.vs_raw` is `info`, not `warn`: on a holdout of a few
+hundred items, ECE differences of ~0.01 are inside the bootstrap CI. An
+amber status on noise trains readers to ignore amber. The ECE gate
+remains the enforceable signal.
+
+### 11.6 Status presentation
+
+| status | badge label (full) | badge label (plan_only) | colour |
+|--------|--------------------|--------------------------|--------|
+| `failed` | "Gate failed" | "Gate failed" | red |
+| `attention` | "Needs attention" | "Needs attention" | amber |
+| `ok` | "On track" | "Plan only — not backtested" | green (full) / neutral slate (plan_only: unvalidated is not "green") |
+
+**Headline (`<h1>`)**: when status ≠ `ok`, the `title` of the first check;
+otherwise a fixed "working as planned" sentence (full) or "plan computed;
+run a backtest to validate it" (plan_only). **Lede**: one to three
+sentences generated from the KPIs: items reviewed (count and share),
+share of loss caught and lift vs random, and unreviewed risk, actual vs
+planned (plus the declared limit when that gate fails). In plan_only, the
+lede uses the expected figures and says so.
+
+### 11.7 KPI tiles
+
+Four tiles, in this order, each with `data-kpi`:
+
+| `data-kpi` | label | full mode value (sub-line) | plan_only value (sub-line) |
+|------------|-------|-----------------------------|-----------------------------|
+| `reviewed` | Items reviewed | replayed `strategies.policy.n_review` (share of `n_total`; budget; "+N over plan (ties)" if replayed > planned) | `policy.totals.n_review` (share; budget) |
+| `capture` | Loss caught | `strategies.policy.capture_rate` as % (`captured_loss` of `total_true_loss` cost units); "—" if null | expected share `expected_captured / (expected_captured + expected_residual)`, labelled "expected"; "—" if the denominator is 0 |
+| `lift` | vs. random review | `captured_loss / random.captured_loss_mean` ("—" if the mean is 0) (lift vs raw confidence, same rule) | "—" ("needs a backtest") |
+| `residual` | Risk left unreviewed | `strategies.policy.residual_loss` (plan expected + ratio; declared limit if any) | `policy.totals.expected_residual_loss`, labelled "expected" (declared limit if any) |
+
+Budget display by `budget.type`: `fraction` → "budget 10%"; `count` →
+"budget 1,000 items"; `money` → "budget 4,000 cost units". The `residual`
+value is coloured red if a residual-risk gate check failed, amber if
+`plan.vs_actual` is `warn`, neutral otherwise (never green: a number alone
+is not a verdict).
+
+### 11.8 Per-segment table
+
+One row per segment (sorted by actual unreviewed risk DESC, then name ASC,
+in full mode; by name ASC in plan_only), plus a totals row. Columns:
+segment; cost per miss / per review (via `CostModel.costs_for` semantics on
+`policy.config_snapshot`: exact key, else `default`); `p_error` review
+threshold ("—" if null); reviewed (planned, and replayed when it differs)
+of `n_total`; unreviewed risk: plan; unreviewed risk: actual (full); actual
+÷ plan (full; "—" when plan is 0). The ratio cell uses amber text when it
+exceeds `R`. The previous v1 expected-captured column is dropped from the
+table (still in policy.json).
+
+### 11.9 Gates table (informational)
+
+Same rows and semantics as v1 (see docs/risk-register.md R2): declared
+thresholds from `policy.config_snapshot.gates` vs measured values, verdict
+PASS/FAIL with the same strict `>` as the CLI gates, "not set" for
+null/absent gates. Every row names its checked artifact field. Rows: `max_ece` vs the statistic
+selected by `gates.ece_gate_mode` (absent means `point`):
+`calibrator.ece_holdout` for `point`, `calibrator.ece_ci[1]` for `ci_upper`.
+Unknown modes display no verdict;
+`max_residual_risk` vs planned `policy.totals.expected_residual_loss`;
+`max_residual_risk` vs realized `strategies.policy.residual_loss` (full
+only); budget adherence (full only, always informational, no verdict):
+planned vs replayed `n_review` with the replayed/planned ratio ("—" if
+planned is 0). Verdicts render as badges whose text is exactly `PASS`,
+`FAIL` or `not set` (e.g. `<span class="badge b-pass">PASS</span>`). Purely
+display: the report still exits non-zero only on contract violations ("no
+gates beyond exit 1" stands).
+
+### 11.10 Figures
+
+All plotly, explicit `div_id`s, no fixed pixel width (the figure fills its
+container; fixed height), direct labels preferred over legends:
+
+| `div_id` | mode | content |
+|----------|------|---------|
+| `fig-backtest` | full | Horizontal bars: share of loss caught (`capture_rate`) for policy, random (error bar = `captured_loss_std / total_true_loss`), raw confidence; each baseline annotated with the policy's lift ("policy 4.2× better"). Replaces v1's absolute captured-loss bars. |
+| `fig-coverage` | full | The three `curves` series vs `grid` (x: share of items reviewed, y: share of loss caught), line-end labels instead of a legend, vertical marker at the PLANNED budget fraction (`policy.totals.n_review / n_total`) with each curve's value at the nearest grid point annotated. If the fraction exceeds the grid (> 0.50), omit the marker. |
+| `fig-segments` | full | Per segment: unreviewed risk, plan (outlined) vs actual (solid), annotated with the actual/plan ratio; same row order as §11.8. |
+| `fig-reliability` | both | Before (raw score) / after (calibrated) reliability curves from `calibrator.reliability_bins` (skip `count == 0` bins), diagonal reference, marker area ∝ bin `count` (hover shows the count). |
+
+### 11.11 Visual system, formatting, template
+
+1. **Palette** (pinned in report.py; the report owns it):
+   series: policy `#2a78d6`, raw confidence `#7c5cc4`, random `#9aa1a9`;
+   status: ok `#15803d`, attention `#d97706`, failed `#dc2626`, info/neutral
+   `#64748b`; ink `#1f2933`. Status colours are reserved for verdicts, and no
+   data series uses green, amber or red. `scripts/headline_chart.py` still
+   uses the v1 palette; aligning it (and regenerating `docs/headline.png`)
+   is a follow-up, not part of this contract.
+2. **Type**: system font stack only
+   (`-apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif`),
+   monospace stack for hashes. No web fonts. All CSS is inline in the
+   template.
+3. **Number formatting**: locale-free Jinja filters registered on the
+   environment, pure Python format specs:
+   `count` → `{:,d}` (1,183); `cost` → `{:,.0f}` (336,100);
+   `pct` → share × 100 with 1 decimal + "%" (41.9%); `ratio` → `{:.2f}×`
+   (2.36×); `lift` → `{:.1f}×` below 10, `{:.0f}×` from 10 (4.2×, 20×);
+   `ece` → `{:.3f}`. `None` renders as "—" in every filter.
+4. **Template** is a package resource: `src/triage/templates/report.html.j2`,
    loaded with `jinja2.Environment(loader=PackageLoader("triage"),
-   autoescape=True, keep_trailing_newline=True)`; numbers formatted IN the
-   template/filters with explicit format specs (no locale). Charts reuse
-   the palette of scripts/headline_chart.py (`#2a78d6` policy, `#1baf7a`
-   raw, `#eda100` random, ink `#333333`).
-7. `pyproject.toml` must package the template (hatchling includes
-   `src/triage` by default — verify the built wheel contains it; if a
-   `[tool.hatch.build]` include is needed, add it).
+   autoescape=True, keep_trailing_newline=True)`. Template partials/macros
+   under `src/triage/templates/` are allowed. `pyproject.toml` must package
+   them (verify the built wheel).
+5. **Stable test hooks** (tests use these, not headings or copy):
+   `main[data-status]`, `main[data-mode]`, the section ids of §11.4,
+   `[data-check-id]` + `[data-severity]`, `[data-kpi]`, the figure
+   `div_id`s, and `#created-at`.
+
+### 11.12 Changes from v1 §11 (traceability)
+
+- Section order: v1 opened with the hash table. Now at-a-glance → results →
+  segments → calibration → gates → audit, and the hash table moves into a
+  collapsed `<details>` (full hashes still in the DOM).
+- NEW: summary model, checks, status, headline/lede, KPI tiles (§11.5–11.7).
+- NEW: per-segment plan-vs-actual (backtest `strategies.policy.segments`
+  was in the artifact but never rendered) and per-segment costs; `fig-segments`.
+- `fig-backtest` now plots capture share with lift annotations instead of
+  absolute captured loss; `fig-coverage` gains value annotations;
+  `fig-reliability` encodes bin counts.
+- plotly.js: v1 embedded it in the FIRST figure; now it is one standalone
+  script after the at-a-glance section.
+- Palette: raw confidence green → purple, random amber → grey (§11.11.1).
+- Gates table unchanged in semantics; verdicts become badges (text
+  unchanged). Its heading is no longer followed by a "Backtest" `<h2>`
+  (tests that sliced `<h2>Gates</h2>…<h2>Backtest</h2>` move to `#gates`).
+- Plan-only note unchanged in meaning; now placed in the results slot.
 
 ## 12. CI workflow (`.github/workflows/ci.yml`) — v1
 

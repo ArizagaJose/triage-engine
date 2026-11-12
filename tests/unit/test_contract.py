@@ -1,11 +1,11 @@
-"""Tests for triage.contract: validate() and read_input()."""
+"""Input contract: validate(), read_input(), validate_seed() (docs/interfaces.md §2)."""
 
 from pathlib import Path
 
 import polars as pl
 import pytest
 
-from triage.contract import read_input, validate
+from triage.contract import read_input, validate, validate_seed
 from triage.exceptions import ContractViolation
 
 
@@ -333,3 +333,14 @@ def test_read_input_require_truth_missing_from_csv(tmp_path: Path) -> None:
 
     with pytest.raises(ContractViolation, match="true_value: required column is missing"):
         read_input(path, require_truth=True)
+
+
+class TestValidateSeed:
+    @pytest.mark.parametrize("seed", [0, 1, 42, 2**63])
+    def test_valid(self, seed: int) -> None:
+        validate_seed(seed)
+
+    @pytest.mark.parametrize("seed", [-1, True, False, 1.0, "42", None])
+    def test_invalid(self, seed: object) -> None:
+        with pytest.raises(ContractViolation, match="seed must be a non-negative integer"):
+            validate_seed(seed)  # type: ignore[arg-type]

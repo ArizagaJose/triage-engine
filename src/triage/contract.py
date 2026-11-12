@@ -137,3 +137,11 @@ def read_input(path: Path, *, require_truth: bool = False) -> pl.DataFrame:
         )
 
     return validate(df, require_truth=require_truth)
+
+
+def validate_seed(seed: int) -> None:
+    """Seeds feed np.random.default_rng, which only accepts non-negative
+    integers; anything else is an input contract violation (exit 1), not an
+    internal error. Shared by synth, calibrate and backtest (and hence `run`)."""
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ContractViolation(f"seed must be a non-negative integer, got {seed!r}")

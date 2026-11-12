@@ -1,4 +1,6 @@
-"""Tests for triage.calibration (see docs/interfaces.md §4)."""
+"""Calibration: ECE, isotonic/Platt fit, bootstrap CI, ECE gate (docs/interfaces.md §4)."""
+
+import json
 
 import numpy as np
 import polars as pl
@@ -7,10 +9,13 @@ import pytest
 from triage import synth
 from triage.artifacts import canonical_dumps
 from triage.calibration import (
+    DEFAULT_ECE_GATE_MODE,
+    ECE_GATE_MODES,
     CalibrationConfig,
     Calibrator,
     check_ece_gate,
     ece,
+    ece_gate_statistic,
     fit,
 )
 from triage.exceptions import CalibrationGateFailed, ContractViolation
@@ -159,7 +164,6 @@ def test_round_trip_predict_bit_identical() -> None:
 
 
 def test_round_trip_to_dict_json_safe() -> None:
-    import json
 
     golden = _make_golden(1500, seed=11)
     cal = fit(golden, seed=11)
@@ -217,6 +221,174 @@ def test_check_ece_gate_message_contains_both_numbers() -> None:
     message = str(exc_info.value)
     assert str(cal.ece_holdout) in message
     assert str(max_ece) in message
+
+
+# ---------------------------------------------------------------------------
+# check_ece_gate modes: "point" (default) vs "ci_upper"
+# ---------------------------------------------------------------------------
+
+# The exact top-level key set of a calibrator.json written before ece gate
+# modes existed (interfaces.md §7). Gate modes add NO key to the calibrator
+# artifact, so this is also the current key set; the handcrafted artifacts
+# below are therefore "old" artifacts in every respect.
+_PINNED_CALIBRATOR_KEYS = {
+    "config",
+    "created_at",
+    "ece_ci",
+    "ece_holdout",
+    "ece_raw_holdout",
+    "input_sha256",
+    "method",
+    "n_golden",
+    "params",
+    "reliability_bins",
+    "seed",
+    "tool_version",
+}
+
+
+def _calibrator_artifact(
+    *, ece_holdout: float, ece_ci: tuple[float, float], ci_level: float = 0.95
+) -> dict[str, object]:
+    """A handcrafted calibrator.json dict with chosen ECE numbers, so gate
+    tests do not depend on what a fit happens to produce."""
+    return {
+        "config": {
+            "ci_level": ci_level,
+            "holdout_fraction": 0.3,
+            "n_bins": 10,
+            "n_bootstrap": 1000,
+        },
+        "created_at": "2026-07-01T00:00:00+00:00",
+        "ece_ci": [ece_ci[0], ece_ci[1]],
+        "ece_holdout": ece_holdout,
+        "ece_raw_holdout": 0.13,
+        "input_sha256": "a" * 64,
+        "method": "platt",
+        "n_golden": 2000,
+        "params": {"a": -3.0, "b": 1.0},
+        "reliability_bins": {"after": [], "before": []},
+        "seed": 42,
+        "tool_version": "0.1.0",
+    }
+
+
+def _gate_calibrator(
+    *, ece_holdout: float = 0.04, ece_ci: tuple[float, float] = (0.02, 0.08)
+) -> Calibrator:
+    return Calibrator.from_dict(_calibrator_artifact(ece_holdout=ece_holdout, ece_ci=ece_ci))
+
+
+def test_ece_gate_modes_and_default() -> None:
+    assert ECE_GATE_MODES == ("point", "ci_upper")
+    assert DEFAULT_ECE_GATE_MODE == "point"
+
+
+def test_point_passes_but_ci_upper_fails() -> None:
+    """The case the mode exists for: point estimate under the threshold, the
+    upper CI bound over it."""
+    cal = _gate_calibrator(ece_holdout=0.04, ece_ci=(0.02, 0.08))
+    check_ece_gate(cal, 0.05, "point")  # 0.04 <= 0.05
+    with pytest.raises(CalibrationGateFailed) as exc_info:
+        check_ece_gate(cal, 0.05, "ci_upper")  # 0.08 > 0.05
+    message = str(exc_info.value)
+    assert "ece_gate_mode=ci_upper" in message
+    assert "ece_ci_upper=0.08" in message
+    assert "max_ece=0.05" in message
+    assert "95% bootstrap CI" in message
+    # The point estimate is reported for context, not as the checked value.
+    assert "ece_holdout=0.04" in message
+
+
+def test_default_mode_is_point_estimate() -> None:
+    """Omitting `mode` keeps the original semantics: only ece_holdout is
+    compared, a failing upper bound is ignored."""
+    cal = _gate_calibrator(ece_holdout=0.04, ece_ci=(0.02, 0.08))
+    check_ece_gate(cal, 0.05)  # would fail under ci_upper
+    with pytest.raises(CalibrationGateFailed) as exc_info:
+        check_ece_gate(cal, 0.039)
+    message = str(exc_info.value)
+    assert "ece_gate_mode=point" in message
+    assert "ece_holdout=0.04" in message
+
+
+def test_both_modes_pass_when_upper_bound_within() -> None:
+    cal = _gate_calibrator(ece_holdout=0.04, ece_ci=(0.02, 0.08))
+    check_ece_gate(cal, 0.09, "point")
+    check_ece_gate(cal, 0.09, "ci_upper")
+
+
+def test_both_modes_fail_when_point_above() -> None:
+    cal = _gate_calibrator(ece_holdout=0.04, ece_ci=(0.02, 0.08))
+    for mode in ECE_GATE_MODES:
+        with pytest.raises(CalibrationGateFailed):
+            check_ece_gate(cal, 0.03, mode)
+
+
+@pytest.mark.parametrize("mode", ECE_GATE_MODES)
+def test_gate_equality_at_threshold_passes(mode: str) -> None:
+    """Strict `>`: a checked value exactly equal to max_ece passes; a max_ece
+    one ULP below the checked value fails."""
+    cal = _gate_calibrator(ece_holdout=0.04, ece_ci=(0.02, 0.08))
+    checked = cal.ece_holdout if mode == "point" else cal.ece_ci[1]
+    check_ece_gate(cal, checked, mode)
+    with pytest.raises(CalibrationGateFailed):
+        check_ece_gate(cal, float(np.nextafter(checked, 0.0)), mode)
+
+
+def test_ci_upper_checks_the_upper_bound_not_the_lower() -> None:
+    cal = _gate_calibrator(ece_holdout=0.04, ece_ci=(0.02, 0.08))
+    # Between lower bound and point estimate: the lower bound would pass,
+    # the upper bound must not.
+    with pytest.raises(CalibrationGateFailed):
+        check_ece_gate(cal, 0.03, "ci_upper")
+
+
+@pytest.mark.parametrize("mode", ["upper", "CI_UPPER", "", "ci_lower", "Point"])
+def test_unknown_gate_mode_is_contract_violation(mode: str) -> None:
+    cal = _gate_calibrator()
+    with pytest.raises(ContractViolation) as exc_info:
+        check_ece_gate(cal, 0.05, mode)
+    message = str(exc_info.value)
+    assert repr(mode) in message
+    assert "point" in message and "ci_upper" in message
+
+
+def test_ece_gate_statistic_reports_field_and_ci_level() -> None:
+    cal = Calibrator.from_dict(
+        _calibrator_artifact(ece_holdout=0.04, ece_ci=(0.02, 0.08), ci_level=0.9)
+    )
+    point = ece_gate_statistic(cal, "point")
+    assert (point.name, point.value) == ("ece_holdout", 0.04)
+    upper = ece_gate_statistic(cal, "ci_upper")
+    assert (upper.name, upper.value) == ("ece_ci_upper", 0.08)
+    assert "90% bootstrap CI" in upper.description
+    assert "ece_ci[1]" in upper.description
+
+
+def test_old_calibrator_artifact_supports_both_modes() -> None:
+    """Backwards compatibility: a calibrator.json with exactly the pinned
+    pre-existing key set loads and gates in both modes, and re-serializes to
+    the same key set (gate modes add nothing to the calibrator artifact, so
+    its content_hash -- and every policy_hash built on it -- is unaffected)."""
+    artifact = _calibrator_artifact(ece_holdout=0.04, ece_ci=(0.02, 0.08))
+    assert set(artifact) == _PINNED_CALIBRATOR_KEYS
+    cal = Calibrator.from_dict(artifact)
+    check_ece_gate(cal, 0.05, "point")
+    with pytest.raises(CalibrationGateFailed):
+        check_ece_gate(cal, 0.05, "ci_upper")
+    assert set(cal.to_dict()) | {"created_at"} == _PINNED_CALIBRATOR_KEYS
+
+
+def test_ci_upper_on_real_fit_uses_fitted_interval() -> None:
+    """On a real fit, ci_upper gates exactly at the fitted ece_ci[1]."""
+    golden = _make_golden(500, seed=5)
+    cal = fit(golden, seed=5)
+    assert cal.ece_ci[1] > cal.ece_holdout  # sanity for the next assertions
+    check_ece_gate(cal, cal.ece_ci[1], "ci_upper")
+    with pytest.raises(CalibrationGateFailed):
+        check_ece_gate(cal, cal.ece_holdout, "ci_upper")
+    check_ece_gate(cal, cal.ece_holdout, "point")
 
 
 # ---------------------------------------------------------------------------
@@ -349,3 +521,8 @@ def test_fit_one_holdout_fraction_empty_calibration() -> None:
     assert "n_golden=100" in message
     assert "n_calibration=0" in message
     assert "n_holdout=100" in message
+
+
+def test_fit_negative_seed_is_contract_violation() -> None:
+    with pytest.raises(ContractViolation, match="seed must be a non-negative integer"):
+        fit(_make_golden(50, seed=1), seed=-1)

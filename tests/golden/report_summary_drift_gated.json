@@ -1,0 +1,65 @@
+{
+  "checks": [
+    [
+      "gate.max_residual_risk.realized",
+      "fail"
+    ],
+    [
+      "plan.vs_actual",
+      "warn"
+    ],
+    [
+      "calibration.vs_raw",
+      "info"
+    ],
+    [
+      "calibration.ci_margin",
+      "info"
+    ],
+    [
+      "gate.max_ece",
+      "pass"
+    ],
+    [
+      "gate.max_residual_risk.planned",
+      "pass"
+    ],
+    [
+      "value.vs_baselines",
+      "pass"
+    ],
+    [
+      "budget.adherence",
+      "pass"
+    ]
+  ],
+  "kpis": {
+    "capture": {
+      "captured": 242500.0,
+      "denom": 578600.0,
+      "is_expected": false,
+      "value": 0.4191151054268925
+    },
+    "lift": {
+      "random": 4.172821937514358,
+      "raw": 20.157938487115544
+    },
+    "residual": {
+      "color": "fail",
+      "is_expected": false,
+      "limit": 200000.0,
+      "plan_expected": 142706.27376309276,
+      "ratio": 2.3551872747932645,
+      "value": 336100.0
+    },
+    "reviewed": {
+      "budget_label": "budget 10%",
+      "over_plan": null,
+      "share": 0.1,
+      "total": 10000,
+      "value": 1000
+    }
+  },
+  "mode": "full",
+  "status": "failed"
+}

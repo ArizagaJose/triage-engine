@@ -1,190 +1,399 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <title>triage report</title>
 <style>
   :root {
-    --ink: #333333;
+    --ink: #1f2933;
+    --muted: #6b7785;
     --policy: #2a78d6;
-    --raw: #1baf7a;
-    --random: #eda100;
+    --raw: #7c5cc4;
+    --random: #9aa1a9;
     --bg: #fcfcfb;
-    --grid: #e6e6e3;
-    --border: #dddddd;
+    --grid: #e7eaee;
+    --border: #e3e6ea;
+    --ok: #15803d;
+    --ok-tint: #ecfdf3;
+    --ok-border: #86d5a4;
+    --attention: #d97706;
+    --attention-tint: #fff8e6;
+    --attention-border: #f5c26b;
+    --failed: #dc2626;
+    --failed-tint: #fef2f2;
+    --failed-border: #f3a5a5;
+    --neutral: #64748b;
+    --neutral-tint: #f1f5f9;
+    --neutral-border: #cbd5e1;
   }
   * { box-sizing: border-box; }
   body {
-    font-family: Arial, Helvetica, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     color: var(--ink);
-    background: var(--bg);
+    background: #f3f4f6;
     margin: 0;
     padding: 0 0 3rem 0;
+    line-height: 1.55;
+    font-size: 15px;
   }
   main {
-    max-width: 960px;
-    margin: 0 auto;
-    padding: 1.5rem;
-  }
-  h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
-  h2 { font-size: 1.25rem; margin-top: 2.5rem; border-bottom: 1px solid var(--border); padding-bottom: 0.25rem; }
-  h3 { font-size: 1.05rem; margin-top: 1.5rem; }
-  .meta { color: #666666; font-size: 0.9rem; margin: 0.1rem 0; }
-  table {
-    border-collapse: collapse;
-    width: 100%;
-    margin: 0.75rem 0 1.25rem 0;
-    font-size: 0.9rem;
-  }
-  th, td {
+    max-width: 880px;
+    margin: 1.75rem auto;
+    background: #fff;
     border: 1px solid var(--border);
-    padding: 0.35rem 0.6rem;
-    text-align: right;
+    padding: 2.75rem 3.5rem 2.5rem;
   }
-  th, td:first-child { text-align: left; }
-  th { background: #f2f2f0; }
-  code.hash {
-    font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+  header.page-head {
+    border-bottom: 1px solid #eceef1;
+    padding-bottom: 0.75rem;
+    margin-bottom: 1.6rem;
     font-size: 0.8rem;
-    word-break: break-all;
+    color: var(--muted);
   }
+  header.page-head .brand { letter-spacing: 0.1em; text-transform: uppercase; font-weight: bold; color: var(--ink); }
+  header.page-head .right { float: right; text-align: right; }
+  header.page-head .chain-ok { color: var(--ok); font-weight: bold; }
+  h1 { font-size: 1.7rem; line-height: 1.25; margin: 0.7rem 0 0.6rem; letter-spacing: -0.01em; }
+  h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);
+       margin: 2.4rem 0 0.9rem; padding-bottom: 0.5rem; border-bottom: 1px solid #eceef1; }
+  h3 { font-size: 1.02rem; margin-top: 1.4rem; }
+  p.lede { font-size: 1.05rem; color: #3b4652; margin: 0 0 1.7rem; max-width: 680px; }
+  .meta { color: var(--muted); font-size: 0.85rem; margin: 0.1rem 0; }
+  .status-badge {
+    display: inline-block; font-size: 0.75rem; font-weight: bold; letter-spacing: 0.05em;
+    text-transform: uppercase; padding: 0.2rem 0.65rem 0.2rem 0.5rem; border-radius: 999px;
+  }
+  .status-badge .dot { display: inline-block; width: 0.5rem; height: 0.5rem; border-radius: 50%;
+                        margin-right: 0.35rem; vertical-align: 1px; }
+  .status-ok { background: var(--ok-tint); color: var(--ok); }
+  .status-attention { background: var(--attention-tint); color: var(--attention); }
+  .status-failed { background: var(--failed-tint); color: var(--failed); }
+  .status-neutral { background: var(--neutral-tint); color: var(--neutral); }
+  .kpis { display: table; width: 100%; table-layout: fixed; border-top: 1px solid #eceef1;
+          border-bottom: 1px solid #eceef1; margin: 0 0 1.8rem; }
+  .kpi { display: table-cell; padding: 1rem 1rem 1rem 1.1rem; border-left: 1px solid #eceef1; vertical-align: top; }
+  .kpi:first-child { border-left: none; padding-left: 0; }
+  .kpi .label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: bold; }
+  .kpi .big { font-size: 1.8rem; font-weight: bold; line-height: 1.2; margin: 0.25rem 0 0.15rem; letter-spacing: -0.01em; }
+  .kpi .sub { font-size: 0.78rem; color: var(--muted); line-height: 1.4; }
+  .kpi .big.c-fail { color: var(--failed); }
+  .kpi .big.c-warn { color: var(--attention); }
+  .kpi .big.c-policy { color: var(--policy); }
+  .checks { margin-top: 0.4rem; }
+  details.check {
+    border: 1px solid var(--border); border-top: none; padding: 0;
+  }
+  details.check:first-of-type { border-top: 1px solid var(--border); border-radius: 7px 7px 0 0; }
+  details.check:last-of-type { border-radius: 0 0 7px 7px; }
+  details.check summary {
+    list-style: none; cursor: pointer; padding: 0.7rem 1rem 0.7rem 3.1rem; position: relative;
+  }
+  details.check summary::-webkit-details-marker { display: none; }
+  details.check:not([open]) .dbody { display: none; }
+  details.check .dbody { padding: 0 1rem 1.1rem 3.1rem; font-size: 0.88rem; color: #4a5562; }
+  details.check.warn { border-left: 3px solid var(--attention); background: #fffdf7; }
+  details.check.fail { border-left: 3px solid var(--failed); background: #fffafa; }
+  .sev-icon {
+    position: absolute; left: 1rem; top: 0.75rem; display: inline-block; width: 1.3rem; height: 1.3rem;
+    line-height: 1.3rem; border-radius: 50%; color: #fff; text-align: center; font-weight: bold;
+    font-size: 0.8rem; font-family: Arial, "DejaVu Sans", sans-serif;
+  }
+  .sev-icon.fail { background: var(--failed); }
+  .sev-icon.warn { background: var(--attention); }
+  .sev-icon.info { background: var(--neutral); }
+  .sev-icon.pass { background: var(--ok); }
+  .check .val { float: right; font-size: 0.85rem; color: var(--muted); margin-top: 0.05rem; }
+  .check .evidence-link { float: right; font-size: 0.78rem; margin-left: 0.8rem; color: var(--policy); text-decoration: none; }
+  .check .t { font-weight: bold; }
+  .figure-wrap { margin: 0.9rem 0 1.1rem; }
+  table.tbl { border-collapse: collapse; width: 100%; margin: 0.6rem 0 1.1rem; font-size: 0.88rem; }
+  table.tbl th, table.tbl td {
+    border-bottom: 1px solid #eef0f2; padding: 0.45rem 0.6rem; text-align: right;
+  }
+  table.tbl th { text-align: right; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em;
+                 color: var(--muted); font-weight: bold; vertical-align: bottom; line-height: 1.3;
+                 border-bottom: 1.5px solid #d9dde2; }
+  table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
+  table.tbl tr.totals td { border-top: 1.5px solid #d9dde2; font-weight: bold; }
+  .muted { color: var(--muted); }
+  .warn-text { color: var(--attention); }
+  .fail-text { color: var(--failed); }
+  .badge { display: inline-block; font-size: 0.7rem; font-weight: bold; padding: 0.1rem 0.5rem; border-radius: 4px; letter-spacing: 0.03em; }
+  .b-pass { background: var(--ok-tint); color: var(--ok); }
+  .b-fail { background: var(--failed-tint); color: var(--failed); }
+  .b-none { background: var(--neutral-tint); color: var(--neutral); }
+  code.hash { font-family: "SFMono-Regular", Consolas, Menlo, monospace; font-size: 0.78rem; word-break: break-all; background: #f3f4f6; padding: 0.05rem 0.3rem; border-radius: 3px; }
   .note {
-    background: #fff6e0;
-    border: 1px solid #eda100;
-    padding: 0.75rem 1rem;
-    border-radius: 4px;
+    background: #f7f8fa; border-left: 3px solid var(--neutral-border); padding: 0.75rem 1rem;
+    border-radius: 4px; font-size: 0.92rem; color: #4a5562;
   }
-  .figure-wrap { margin: 1rem 0; }
+  details.audit { border: 1px solid var(--border); border-radius: 7px; }
+  details.audit summary { padding: 0.75rem 1rem; cursor: pointer; list-style: none; font-size: 0.88rem; }
+  details.audit summary::-webkit-details-marker { display: none; }
+  details.audit:not([open]) .dbody { display: none; }
+  details.audit .dbody { padding: 0 1rem 0.75rem; }
+  .arrow { color: var(--muted); margin: 0 0.4rem; }
+  footer.page-foot { margin-top: 2rem; font-size: 0.78rem; color: #8a949e; border-top: 1px solid #eceef1; padding-top: 0.75rem; }
 </style>
 </head>
 <body>
-<main>
-  <h1>triage report</h1>
-  <p class="meta">tool_version: {{ tool_version }}</p>
+<main data-status="{{ summary.status }}" data-mode="{{ summary.mode }}">
+
+<header class="page-head">
+  <span class="brand">triage</span> &nbsp;review routing report
+  <span class="right">
+    tool_version: {{ tool_version }}<br>
+    <span class="chain-ok">&#10003; artifact chain verified</span>
+  </span>
   <p id="created-at" class="meta">{{ created_at }}</p>
+</header>
 
-  <h2>Artifact hash chain</h2>
-  <table>
-    <tr><th>artifact</th><th>hash</th></tr>
-    {% for label, value in hash_rows %}
-    <tr><td>{{ label }}</td><td><code class="hash">{{ value }}</code></td></tr>
+<section id="at-a-glance">
+  <span class="status-badge status-{{ status_color }}">
+    <span class="dot"></span>{{ status_label }}
+  </span>
+  {% if summary.status != "ok" %}
+  <h1>{{ summary.checks[0].title }}</h1>
+  {% elif summary.mode == "full" %}
+  <h1>The review policy is working as planned</h1>
+  {% else %}
+  <h1>The plan looks consistent; run a backtest to validate it</h1>
+  {% endif %}
+
+  {% set k = summary.kpis %}
+  <p class="lede">
+    {% if summary.mode == "full" %}
+    Reviewing <b>{{ k.reviewed.value|fmt_count }}</b> of {{ k.reviewed.total|fmt_count }} items
+    ({{ k.reviewed.share|fmt_pct }}) caught <b>{{ k.capture.value|fmt_pct }}</b> of the loss from
+    model errors &mdash; {{ k.lift.random|fmt_lift }} more than random review.
+    Errors left unreviewed cost <b>{{ k.residual.value|fmt_cost }}</b> cost units,
+    {% if k.residual.color == "fail" %}
+      {{ k.residual.ratio|fmt_ratio }} the {{ k.residual.plan_expected|fmt_cost }} the plan expected and
+      above the declared limit of {{ k.residual.limit|fmt_cost }}.
+    {% elif k.residual.color == "warn" %}
+      {{ k.residual.ratio|fmt_ratio }} the {{ k.residual.plan_expected|fmt_cost }} the plan expected.
+      The model's error pattern has likely changed since calibration.
+    {% else %}
+      in line with the {{ k.residual.plan_expected|fmt_cost }} the plan expected.
+    {% endif %}
+    {% else %}
+    The plan expects to review <b>{{ k.reviewed.value|fmt_count }}</b> of {{ k.reviewed.total|fmt_count }}
+    items ({{ k.reviewed.share|fmt_pct }}), catching an expected <b>{{ k.capture.value|fmt_pct }}</b> of loss
+    and leaving <b>{{ k.residual.value|fmt_cost }}</b> cost units of expected unreviewed risk{%
+    if k.residual.limit is not none %} (declared limit {{ k.residual.limit|fmt_cost }}){% endif %}.
+    Run a backtest to see what actually happens on labeled history.
+    {% endif %}
+  </p>
+
+  <div class="kpis">
+    <div class="kpi" data-kpi="reviewed">
+      <div class="label">Items reviewed</div>
+      <div class="big">{{ k.reviewed.value|fmt_count }}</div>
+      <div class="sub">{{ k.reviewed.share|fmt_pct }} of {{ k.reviewed.total|fmt_count }}
+        &middot; {{ k.reviewed.budget_label }}
+        {%- if k.reviewed.over_plan %} &middot; <span class="warn-text">+{{ k.reviewed.over_plan|fmt_count }} over plan (ties)</span>{% endif %}</div>
+    </div>
+    <div class="kpi" data-kpi="capture">
+      <div class="label">Loss caught{% if k.capture.is_expected %} (expected){% endif %}</div>
+      <div class="big c-policy">{{ k.capture.value|fmt_pct }}</div>
+      <div class="sub">{{ k.capture.captured|fmt_cost }} of {{ k.capture.denom|fmt_cost }} cost units</div>
+    </div>
+    <div class="kpi" data-kpi="lift">
+      <div class="label">vs. random review</div>
+      <div class="big">{{ k.lift.random|fmt_lift }}</div>
+      <div class="sub">
+        {% if k.lift.raw is none %}needs a backtest to compare against baselines
+        {% else %}{{ k.lift.raw|fmt_lift }} vs. raw model confidence, same review effort{% endif %}
+      </div>
+    </div>
+    <div class="kpi" data-kpi="residual">
+      <div class="label">Risk left unreviewed{% if k.residual.is_expected %} (expected){% endif %}</div>
+      <div class="big {% if k.residual.color == 'fail' %}c-fail{% elif k.residual.color == 'warn' %}c-warn{% endif %}">{{ k.residual.value|fmt_cost }}</div>
+      <div class="sub">
+        {%- if not k.residual.is_expected -%}
+          plan expected {{ k.residual.plan_expected|fmt_cost }}
+          {%- if k.residual.limit is not none %} &middot; limit {{ k.residual.limit|fmt_cost }}{% endif -%}
+        {%- else -%}
+          {%- if k.residual.limit is not none -%}
+            declared limit {{ k.residual.limit|fmt_cost }}
+          {%- else -%}
+            no limit declared
+          {%- endif -%}
+        {%- endif -%}
+      </div>
+    </div>
+  </div>
+
+  <div class="checks">
+    {% for c in summary.checks %}
+    <details class="check {{ c.severity }}" data-check-id="{{ c.id }}" data-severity="{{ c.severity }}"
+              {% if c.severity in ("fail", "warn") %}open{% endif %}>
+      <summary>
+        <span class="sev-icon {{ c.severity }}">{{ severity_icon[c.severity] }}</span>
+        <span class="val">{{ c.value }}</span>
+        <a class="evidence-link" href="#{{ c.section }}">evidence &#9656;</a>
+        <div class="t">{{ c.title }}</div>
+      </summary>
+      <div class="dbody">{{ c.detail }}</div>
+    </details>
     {% endfor %}
-  </table>
+  </div>
+</section>
 
-  <h2>Calibration</h2>
-  <p class="meta">method: {{ calibration.method }} &middot; n_golden: {{ calibration.n_golden }} &middot; seed: {{ calibration.seed }}</p>
-  <table>
-    <tr><th>metric</th><th>raw score</th><th>calibrated</th></tr>
+<script type="text/javascript">{{ plotly_bundle|safe }}</script>
+
+<section id="results">
+  <h2>Is the policy worth it?</h2>
+  {% if summary.mode == "full" %}
+  <div class="figure-wrap">{{ figs["fig-backtest"] | safe }}</div>
+  <table class="tbl">
+    <tr><th>strategy</th><th>captured loss</th><th>residual loss</th><th>n_review</th><th>efficiency</th><th>capture_rate</th></tr>
     <tr>
-      <td>ECE (holdout)</td>
-      <td>{{ "%.4f"|format(calibration.ece_raw_holdout) }}</td>
-      <td>{{ "%.4f"|format(calibration.ece_holdout) }} (95% CI [{{ "%.4f"|format(calibration.ece_ci[0]) }}, {{ "%.4f"|format(calibration.ece_ci[1]) }}])</td>
+      <td>policy</td>
+      <td>{{ results.strategies.policy.captured_loss|fmt_cost }}</td>
+      <td>{{ results.strategies.policy.residual_loss|fmt_cost }}</td>
+      <td>{{ results.strategies.policy.n_review|fmt_count }}</td>
+      <td>{{ results.strategies.policy.efficiency|fmt_cost }}</td>
+      <td>{{ results.strategies.policy.capture_rate|fmt_pct(2) }}</td>
+    </tr>
+    <tr>
+      <td>raw confidence</td>
+      <td>{{ results.strategies.raw_confidence.captured_loss|fmt_cost }}</td>
+      <td>{{ results.strategies.raw_confidence.residual_loss|fmt_cost }}</td>
+      <td>{{ results.strategies.raw_confidence.n_review|fmt_count }}</td>
+      <td>{{ results.strategies.raw_confidence.efficiency|fmt_cost }}</td>
+      <td>{{ results.strategies.raw_confidence.capture_rate|fmt_pct(2) }}</td>
+    </tr>
+    <tr>
+      <td>random (mean &plusmn; std)</td>
+      <td>{{ results.strategies.random.captured_loss_mean|fmt_cost }} &plusmn; {{ results.strategies.random.captured_loss_std|fmt_cost }}</td>
+      <td>{{ results.strategies.random.residual_loss_mean|fmt_cost }}</td>
+      <td>{{ results.strategies.random.n_review|fmt_count }}</td>
+      <td>{{ results.strategies.random.efficiency|fmt_cost }}</td>
+      <td>{{ results.strategies.random.capture_rate|fmt_pct(2) }}</td>
     </tr>
   </table>
-  <div class="figure-wrap">{{ figs["fig-reliability"] | safe }}</div>
+  <p class="meta">All three strategies review exactly {{ results.n_review|fmt_count }} item(s) at this
+    capacity, so differences in captured loss reflect ranking quality alone.
+    {% if results.tie_inflated %}This is more than the planned review count: several items tie exactly
+    at the threshold (see the "more reviews than planned" check above), which is why this table's
+    capture rate can differ from the coverage curve's value at the budget line below.{% endif %}</p>
+  <div class="figure-wrap">{{ figs["fig-coverage"] | safe }}</div>
+  {% else %}
+  <p class="note">Backtest not run: this report reflects the plan-only pipeline (calibrator + policy).
+    Run <code>triage backtest</code> and re-run <code>triage report</code> to add realized-outcome
+    comparisons and coverage-vs-risk curves.</p>
+  {% endif %}
+</section>
 
-  <h2>Policy summary</h2>
-  <p class="meta">budget: {{ policy.budget.type }} = {{ policy.budget.value }}</p>
-  <table>
-    <tr><th>scope</th><th>n_review</th><th>n_total</th><th>expected captured loss</th><th>expected residual loss</th></tr>
-    <tr>
-      <td>total</td>
-      <td>{{ policy.totals.n_review }}</td>
-      <td>{{ policy.totals.n_total }}</td>
-      <td>{{ "%.2f"|format(policy.totals.expected_captured_loss) }}</td>
-      <td>{{ "%.2f"|format(policy.totals.expected_residual_loss) }}</td>
-    </tr>
-  </table>
-
-  <h3>Per-segment</h3>
-  <table>
-    <tr><th>segment</th><th>p_error threshold</th><th>n_review</th><th>n_total</th><th>expected captured loss</th><th>expected residual loss</th></tr>
-    {% for name, stats in policy.segments %}
-    <tr>
-      <td>{{ name }}</td>
-      <td>{% if stats.p_error_threshold is none %}&mdash;{% else %}{{ "%.4f"|format(stats.p_error_threshold) }}{% endif %}</td>
-      <td>{{ stats.n_review }}</td>
-      <td>{{ stats.n_total }}</td>
-      <td>{{ "%.2f"|format(stats.expected_captured_loss) }}</td>
-      <td>{{ "%.2f"|format(stats.expected_residual_loss) }}</td>
-    </tr>
-    {% endfor %}
-  </table>
-
-  <h2>Gates</h2>
-  <p class="meta">Informational only: declared thresholds vs measured values. This report is not an exit-code gate (see <code>triage plan</code> / <code>triage backtest</code>).</p>
-  <table>
-    <tr><th>gate</th><th>threshold</th><th>value</th><th>verdict</th></tr>
-    {% for row in gates.rows %}
-    {% set fmt = "%.4f" if row.kind == "ece" else "%.2f" %}
+<section id="segments">
+  <h2>Where the risk is</h2>
+  {% if summary.mode == "full" %}
+  <div class="figure-wrap">{{ figs["fig-segments"] | safe }}</div>
+  {% endif %}
+  <table class="tbl">
+    <thead><tr>
+      <th>segment</th>
+      <th title="false_accept_cost / review_cost">cost per miss / review</th>
+      <th title="calibrated p_error threshold">review if P(err) &ge;</th>
+      <th>reviewed</th>
+      <th>unreviewed risk, plan</th>
+      {% if summary.mode == "full" %}<th>unreviewed risk, actual</th><th>actual &divide; plan</th>{% endif %}
+    </tr></thead>
+    <tbody>
+    {% for row in segments.rows %}
     <tr>
       <td>{{ row.name }}</td>
+      <td>{{ row.checked }}</td>
+      <td>{{ row.false_accept_cost|fmt_cost }} / {{ row.review_cost|fmt_cost }}</td>
+      <td>{% if row.threshold is none %}&mdash;{% else %}{{ "%.3f"|format(row.threshold) }}{% endif %}</td>
+      <td>{{ row.n_review_planned|fmt_count }}{% if row.n_review_replayed is not none and row.n_review_replayed != row.n_review_planned %} &rarr; {{ row.n_review_replayed|fmt_count }}{% endif %} <span class="muted">of {{ row.n_total|fmt_count }}</span></td>
+      <td>{{ row.expected_residual|fmt_cost }}</td>
+      {% if summary.mode == "full" %}
+      <td>{{ row.realized_residual|fmt_cost }}</td>
+      <td class="{{ 'warn-text' if (row.ratio is not none and row.ratio > attention_ratio) else '' }}"><b>{{ row.ratio|fmt_ratio }}</b></td>
+      {% endif %}
+    </tr>
+    {% endfor %}
+    <tr class="totals">
+      <td>Total</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+      <td>{{ segments.totals.n_review_planned|fmt_count }}{% if segments.totals.n_review_replayed is not none and segments.totals.n_review_replayed != segments.totals.n_review_planned %} &rarr; {{ segments.totals.n_review_replayed|fmt_count }}{% endif %} <span class="muted">of {{ segments.totals.n_total|fmt_count }}</span></td>
+      <td>{{ segments.totals.expected_residual|fmt_cost }}</td>
+      {% if summary.mode == "full" %}
+      <td>{{ segments.totals.realized_residual|fmt_cost }}</td>
+      <td>{{ segments.totals.ratio|fmt_ratio }}</td>
+      {% endif %}
+    </tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="calibration">
+  <h2>Can we trust the model's probabilities?</h2>
+  <div class="figure-wrap">{{ figs["fig-reliability"] | safe }}</div>
+  <table class="tbl">
+    <tr><th>method</th><td>{{ calibration.method }} &middot; seed {{ calibration.seed }}</td></tr>
+    <tr><th>golden set</th><td>{{ calibration.n_golden|fmt_count }} labeled items</td></tr>
+    <tr><th>ECE, raw &rarr; calibrated</th><td>{{ calibration.ece_raw_holdout|fmt_ece }} &rarr; <b>{{ calibration.ece_holdout|fmt_ece }}</b></td></tr>
+    <tr><th>{{ calibration.ci_label }} interval</th><td>{{ calibration.ece_ci[0]|fmt_ece }} &ndash; {{ calibration.ece_ci[1]|fmt_ece }}</td></tr>
+  </table>
+</section>
+
+<section id="gates">
+  <h2>Gates</h2>
+  <p class="meta">Informational only: declared thresholds vs measured values. This report is not an
+    exit-code gate (see <code>triage plan</code> / <code>triage backtest</code>).</p>
+  <table class="tbl">
+    <tr><th>gate</th><th>checked value</th><th>threshold</th><th>value</th><th>verdict</th></tr>
+    {% for row in gates.rows %}
+    {% set fmt = "%.3f" if row.kind == "ece" else "%.2f" %}
+    <tr>
+      <td>{{ row.name }}</td>
+      <td>{{ row.checked }}</td>
       <td>{% if row.threshold is none %}not set{% else %}{{ fmt|format(row.threshold) }}{% endif %}</td>
       <td>{% if row.value is none %}&mdash;{% else %}{{ fmt|format(row.value) }}{% endif %}</td>
-      <td>{% if row.verdict == "PASS" %}PASS{% elif row.verdict == "FAIL" %}FAIL{% else %}&mdash;{% endif %}</td>
+      <td>
+        {% if row.verdict == "PASS" %}<span class="badge b-pass">PASS</span>
+        {% elif row.verdict == "FAIL" %}<span class="badge b-fail">FAIL</span>
+        {% elif row.verdict == "not set" %}<span class="badge b-none">not set</span>
+        {% else %}&mdash;{% endif %}
+      </td>
     </tr>
     {% endfor %}
     {% if gates.adherence %}
     <tr>
       <td>budget adherence (planned vs replayed n_review)</td>
+      <td>policy.totals.n_review vs backtest.strategies.policy.n_review</td>
       <td>&mdash;</td>
-      <td>{{ gates.adherence.planned_n_review }} vs {{ gates.adherence.replayed_n_review }} (ratio {% if gates.adherence.ratio is none %}&mdash;{% else %}{{ "%.3f"|format(gates.adherence.ratio) }}{% endif %})</td>
+      <td>{{ gates.adherence.planned_n_review|fmt_count }} vs {{ gates.adherence.replayed_n_review|fmt_count }}
+        (ratio {% if gates.adherence.ratio is none %}&mdash;{% else %}{{ "%.3f"|format(gates.adherence.ratio) }}{% endif %})</td>
       <td>&mdash;</td>
     </tr>
     {% endif %}
   </table>
+</section>
 
-  <h2>Backtest</h2>
-  {% if backtest %}
-  <p class="meta">
-    n_history: {{ backtest.n_history }} &middot; n_errors: {{ backtest.n_errors }} &middot;
-    total_true_loss: {{ "%.2f"|format(backtest.total_true_loss) }}
-  </p>
-  <p>
-    Expected residual loss (from the plan): <strong>{{ "%.2f"|format(backtest.expected.expected_residual_loss) }}</strong>
-    &nbsp;vs.&nbsp;
-    realized residual loss (replayed on history): <strong>{{ "%.2f"|format(backtest.realized_residual_loss) }}</strong>
-    (gap: {{ "%.2f"|format(backtest.residual_gap) }})
-  </p>
+<section id="audit">
+  <h2>Audit trail</h2>
+  <details class="audit">
+    <summary>
+      &#9656; {% for label, h in short_chain %}{{ label }} <code class="hash">{{ h[:10] }}</code>{% if not loop.last %}<span class="arrow">&rarr;</span>{% endif %}{% endfor %}
+    </summary>
+    <div class="dbody">
+      <table class="tbl">
+        {% for label, value in hash_rows %}
+        <tr><td>{{ label }}</td><td><code class="hash">{{ value }}</code></td></tr>
+        {% endfor %}
+      </table>
+    </div>
+  </details>
+</section>
 
-  <table>
-    <tr><th>strategy</th><th>captured loss</th><th>residual loss</th><th>n_review</th><th>efficiency</th><th>capture_rate</th></tr>
-    <tr>
-      <td>policy</td>
-      <td>{{ "%.2f"|format(backtest.strategies.policy.captured_loss) }}</td>
-      <td>{{ "%.2f"|format(backtest.strategies.policy.residual_loss) }}</td>
-      <td>{{ backtest.strategies.policy.n_review }}</td>
-      <td>{% if backtest.strategies.policy.efficiency is none %}&mdash;{% else %}{{ "%.2f"|format(backtest.strategies.policy.efficiency) }}{% endif %}</td>
-      <td>{% if backtest.strategies.policy.capture_rate is none %}&mdash;{% else %}{{ "%.4f"|format(backtest.strategies.policy.capture_rate) }}{% endif %}</td>
-    </tr>
-    <tr>
-      <td>raw confidence</td>
-      <td>{{ "%.2f"|format(backtest.strategies.raw_confidence.captured_loss) }}</td>
-      <td>{{ "%.2f"|format(backtest.strategies.raw_confidence.residual_loss) }}</td>
-      <td>{{ backtest.strategies.raw_confidence.n_review }}</td>
-      <td>{% if backtest.strategies.raw_confidence.efficiency is none %}&mdash;{% else %}{{ "%.2f"|format(backtest.strategies.raw_confidence.efficiency) }}{% endif %}</td>
-      <td>{% if backtest.strategies.raw_confidence.capture_rate is none %}&mdash;{% else %}{{ "%.4f"|format(backtest.strategies.raw_confidence.capture_rate) }}{% endif %}</td>
-    </tr>
-    <tr>
-      <td>random (mean &plusmn; std)</td>
-      <td>{{ "%.2f"|format(backtest.strategies.random.captured_loss_mean) }} &plusmn; {{ "%.2f"|format(backtest.strategies.random.captured_loss_std) }}</td>
-      <td>{{ "%.2f"|format(backtest.strategies.random.residual_loss_mean) }}</td>
-      <td>{{ backtest.strategies.random.n_review }}</td>
-      <td>{% if backtest.strategies.random.efficiency is none %}&mdash;{% else %}{{ "%.2f"|format(backtest.strategies.random.efficiency) }}{% endif %}</td>
-      <td>{% if backtest.strategies.random.capture_rate is none %}&mdash;{% else %}{{ "%.4f"|format(backtest.strategies.random.capture_rate) }}{% endif %}</td>
-    </tr>
-  </table>
-  <p class="meta">All three strategies review exactly {{ backtest.n_review }} item(s) at this capacity, so differences in captured loss reflect ranking quality alone.</p>
-  <div class="figure-wrap">{{ figs["fig-backtest"] | safe }}</div>
+<footer class="page-foot">Cost figures are in the units declared in costs.yaml. Generated by triage
+  {{ tool_version }} &middot; deterministic for identical artifacts.</footer>
 
-  <h2>Coverage vs. risk</h2>
-  <p class="meta">Vertical marker at the policy's own review capacity ({{ "%.2f"|format(budget_fraction * 100) }}% of history).</p>
-  <div class="figure-wrap">{{ figs["fig-coverage"] | safe }}</div>
-  {% else %}
-  <p class="note">Backtest not run: this report reflects the plan-only pipeline (calibrator + policy).
-  Run <code>triage backtest</code> and re-run <code>triage report</code> to add realized-outcome
-  comparisons and coverage-vs-risk curves.</p>
-  {% endif %}
 </main>
 </body>
 </html>

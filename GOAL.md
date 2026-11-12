@@ -58,6 +58,9 @@ Strict validation, fail-fast, exit code 1 on violation. No silent coercion.
 - Output: versioned calibrator artifact (JSON) with input hash + reliability
   data for the report (before/after diagrams).
 - ECE gate: if calibration quality is below the declared minimum, exit code 3.
+  The gated statistic is the holdout ECE point estimate by default; the
+  opt-in `ci_upper` mode gates on the bootstrap CI's upper bound instead
+  (`--ece-gate-mode` / `gates.ece_gate_mode`, docs/interfaces.md §4).
 
 ### 2. Cost model (YAML, pydantic-validated)
 
@@ -68,6 +71,7 @@ budget:
 gates:
   max_residual_risk: 250.0   # exit code 2 if exceeded
   max_ece: 0.05              # exit code 3 if exceeded
+  ece_gate_mode: point       # optional: point (ece_holdout, default) | ci_upper (ece_ci[1])
 segments:
   compensation_field:
     false_accept_cost: 500.0
@@ -120,8 +124,14 @@ the result. See docs/risk-register.md (R1).
 
 ### 5. Report (`report`)
 
-Static HTML (jinja2 + plotly): reliability diagrams, coverage-vs-risk curves,
-policy summary, backtest comparison, and the artifact hashes for auditability.
+Static HTML (jinja2 + plotly) for operations people and the team's ML tech
+lead. The answer comes first: an at-a-glance section with a status
+(On track / Needs attention / Gate failed; "Plan only" without a backtest),
+a plain-language summary, four headline numbers and a list of CI-style
+checks. Then the evidence: policy vs baselines, coverage-vs-risk curves,
+per-segment plan vs actual, reliability diagrams, and the gates table.
+The artifact hashes for auditability come last (collapsed). Pinned in
+docs/interfaces.md §11.
 
 ### 6. Synthetic demo (`synth`)
 
@@ -137,13 +147,15 @@ the ground truth, every claim is mathematically verifiable. Three scenarios:
 ## CLI
 
 ```bash
-triage calibrate --golden golden.parquet [--seed N] -o calibrator.json
+triage calibrate --golden golden.parquet [--seed N] [--max-ece F [--ece-gate-mode point|ci_upper]] \
+                 -o calibrator.json
 triage plan --batch batch.parquet --calibrator calibrator.json \
             --costs costs.yaml --budget 0.10 -o policy.json
 triage backtest --policy policy.json --calibrator calibrator.json \
                 --history history.parquet -o backtest.json
 triage report --from artifacts/ -o report.html
 triage synth --scenario overconfident --seed 42 -o data/
+triage run --scenario overconfident --seed 42 -o runs/demo   # whole chain, see interfaces.md §8
 ```
 
 Exit codes (public API, see CLAUDE.md): 0 OK, 1 contract violation,

@@ -1,51 +1,19 @@
-"""Unit tests for the optimizer (greedy budget allocation).
+"""Unit tests for the optimizer (greedy budget allocation, docs/interfaces.md §5).
 
-Calibrator note: calibration.py is being implemented in parallel and its
-Calibrator.predict() may not be functional yet. Per the work-package spec,
-these tests never call triage.calibration.fit(); instead they use a tiny
-local `IdentityCalibrator` stub satisfying `triage.optimizer.PredictsErrors`
-(structural typing) with `predict(scores) = scores`, i.e. we treat the raw
-`score` column directly as `p_error`. This keeps all hand-computed
-expectations in the comments simple and exact.
-"""
+Uses IdentityCalibrator (p_error = score), so the hand-computed expectations
+in the comments are exact."""
 
 import math
 from dataclasses import replace
 
 import numpy as np
-import polars as pl
 import pytest
 
+from tests.support import IdentityCalibrator, batch_frame
 from triage.artifacts import canonical_dumps, content_hash
 from triage.costs import Budget, CostModel, Gates, SegmentCosts
 from triage.exceptions import ContractViolation, ResidualRiskExceeded
 from triage.optimizer import Policy, check_residual_gate, plan
-
-
-class IdentityCalibrator:
-    """Stub satisfying PredictsErrors: p_error = score, unchanged."""
-
-    def predict(self, scores: np.ndarray) -> np.ndarray:
-        return np.asarray(scores, dtype=np.float64)
-
-
-def _batch(rows: list[tuple[str, str, float]]) -> pl.DataFrame:
-    """Build a valid batch dataframe from (item_id, segment, score) tuples."""
-    return pl.DataFrame(
-        {
-            "item_id": [r[0] for r in rows],
-            "segment": [r[1] for r in rows],
-            "score": [r[2] for r in rows],
-            "predicted_value": ["v" for _ in rows],
-        },
-        schema={
-            "item_id": pl.String,
-            "segment": pl.String,
-            "score": pl.Float64,
-            "predicted_value": pl.String,
-        },
-    )
-
 
 CALIBRATOR = IdentityCalibrator()
 
@@ -91,7 +59,7 @@ def _main_cost_model(budget: Budget, gates: Gates = Gates()) -> CostModel:
 
 def _plan(rows: list[tuple[str, str, float]], cost_model: CostModel) -> Policy:
     return plan(
-        _batch(rows),
+        batch_frame(rows),
         CALIBRATOR,
         cost_model,
         input_sha256s={"batch": "b" * 64, "calibrator": "c" * 64, "costs": "d" * 64},
@@ -191,6 +159,17 @@ class TestBudgetEdgeCases:
         cost_model = _main_cost_model(Budget(type="count", value=6))
         policy = _plan(_main_rows(), cost_model)
         assert policy.totals["n_review"] == 4  # still gated by net_benefit > 0
+
+    def test_zero_net_benefit_is_never_routed(self) -> None:
+        # Boundary of "route while net_benefit > 0" (interfaces.md §5.6):
+        # 0.5 * 20 - 10 == 0.0 exactly, so z1 stays unrouted under spare budget.
+        cost_model = CostModel(
+            budget=Budget(type="fraction", value=1.0),
+            segments={"segZ": SegmentCosts(false_accept_cost=20.0, review_cost=10.0)},
+        )
+        policy = _plan([("z1", "segZ", 0.5), ("p1", "segZ", 0.75)], cost_model)
+        assert policy.totals["n_review"] == 1
+        assert policy.segments["segZ"]["p_error_threshold"] == 0.75
 
     def test_money_budget_stops_at_first_non_fitting_item(self) -> None:
         # Dedicated fixture: 4 items, 4 distinct single-item segments so each

@@ -21,16 +21,19 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
+from tests import report_html as rh
 from triage.artifacts import content_hash
 from triage.exceptions import ContractViolation
-from triage.report import render
+from triage.report import ATTENTION_RESIDUAL_RATIO, _build_summary, render
 
-TRIAGE_BIN = shutil.which("triage") or str(Path(__file__).resolve().parents[1] / ".venv/bin/triage")
+TRIAGE_BIN = shutil.which("triage") or str(Path(__file__).resolve().parents[2] / ".venv/bin/triage")
 
 
 def run_cli(args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -52,11 +55,24 @@ def _strip_created_at_line(text: str) -> str:
     return "\n".join(line for line in lines if 'id="created-at"' not in line)
 
 
-def _run_chain(session_dir: Path, name: str, scenario: str, *, seed: int = 42) -> Path:
+def _run_chain(
+    session_dir: Path,
+    name: str,
+    scenario: str,
+    *,
+    seed: int = 42,
+    max_residual_risk: float | None = None,
+    backtest_returncode: int = 0,
+) -> Path:
     """Run the full synth -> calibrate -> plan -> backtest chain for
     `scenario`, writing calibrator.json / policy.json / backtest.json
     directly into a chain directory (so it doubles as a `--from` dir).
-    Returns the chain directory."""
+    Returns the chain directory.
+
+    `max_residual_risk` declares that gate in the emitted costs.yaml before
+    `plan` (the CI workflow's exit-code demo, interfaces.md §12); a chain
+    that trips it passes `backtest_returncode=2` -- the artifact is still
+    written first, so the report can render it (§5.9)."""
     chain_dir = session_dir / name
     data_dir = chain_dir / "data"
 
@@ -79,6 +95,12 @@ def _run_chain(session_dir: Path, name: str, scenario: str, *, seed: int = 42) -
     )
     assert calibrate_result.returncode == 0, calibrate_result.stderr
 
+    costs_path = data_dir / "costs.yaml"
+    if max_residual_risk is not None:
+        costs = yaml.safe_load(costs_path.read_text())
+        costs.setdefault("gates", {})["max_residual_risk"] = max_residual_risk
+        costs_path.write_text(yaml.safe_dump(costs, sort_keys=True))
+
     policy_path = chain_dir / "policy.json"
     plan_result = run_cli(
         [
@@ -88,7 +110,7 @@ def _run_chain(session_dir: Path, name: str, scenario: str, *, seed: int = 42) -
             "--calibrator",
             str(calibrator_path),
             "--costs",
-            str(data_dir / "costs.yaml"),
+            str(costs_path),
             "-o",
             str(policy_path),
         ]
@@ -113,7 +135,7 @@ def _run_chain(session_dir: Path, name: str, scenario: str, *, seed: int = 42) -
             str(backtest_path),
         ]
     )
-    assert backtest_result.returncode == 0, backtest_result.stderr
+    assert backtest_result.returncode == backtest_returncode, backtest_result.stderr
 
     return chain_dir
 
@@ -183,13 +205,14 @@ def test_report_contains_hash_chain(
 
 
 def test_report_contains_pinned_div_ids(report_pair: tuple[Path, Path]) -> None:
-    """Spec G.6: the three pinned div ids (fig-reliability, fig-backtest,
-    fig-coverage) each appear."""
+    """Spec G.6 (+ H preamble): the four pinned div ids (fig-reliability,
+    fig-backtest, fig-coverage, fig-segments) each appear."""
     out_a, _ = report_pair
     html = out_a.read_text()
     assert "fig-reliability" in html
     assert "fig-backtest" in html
     assert "fig-coverage" in html
+    assert "fig-segments" in html
 
 
 def test_report_plotly_embedded_no_network(report_pair: tuple[Path, Path]) -> None:
@@ -339,7 +362,7 @@ def test_report_with_backtest_note_absent(report_pair: tuple[Path, Path]) -> Non
 # --- G.9: report is not an exit-code gate ---
 
 
-# --- Gates panel (docs/interfaces.md §11.4(f)) ---
+# --- Gates panel (docs/interfaces.md §11.9) ---
 
 
 def test_report_contains_gates_section_with_computed_verdict(
@@ -356,7 +379,7 @@ def test_report_contains_gates_section_with_computed_verdict(
     max_ece = gates.get("max_ece")
     ece_holdout = full_chain_dicts["calibrator"]["ece_holdout"]
 
-    gates_section = html.split("<h2>Gates</h2>", 1)[1].split("<h2>Backtest</h2>", 1)[0]
+    gates_section = rh.section(html, "gates")
     assert "max_ece" in gates_section
     if max_ece is None:
         assert "not set" in gates_section
@@ -365,11 +388,181 @@ def test_report_contains_gates_section_with_computed_verdict(
         assert f">{expected_verdict}<" in gates_section
 
 
-def test_report_drift_chain_exits_0(report_session: Path) -> None:
+@pytest.fixture(scope="module")
+def drift_chain_dir(report_session: Path) -> Path:
+    """Full drift seed-42 chain, no residual gate declared."""
+    return _run_chain(report_session, "drift_full", "drift")
+
+
+@pytest.fixture(scope="module")
+def drift_gated_chain_dir(report_session: Path) -> Path:
+    """Drift chain with `max_residual_risk: 200000` declared -- the CI
+    workflow's exit-code demo (interfaces.md §12): plan passes (expected
+    ~142,706), backtest exits 2 (realized ~336,100) but still writes its
+    artifact."""
+    return _run_chain(
+        report_session,
+        "drift_gated_full",
+        "drift",
+        max_residual_risk=200000.0,
+        backtest_returncode=2,
+    )
+
+
+def _report_html(report_session: Path, from_dir: Path, name: str) -> str:
+    out_path = report_session / name
+    result = run_cli(["report", "--from", str(from_dir), "-o", str(out_path)])
+    assert result.returncode == 0, result.stderr
+    return out_path.read_text()
+
+
+def test_report_drift_chain_exits_0(report_session: Path, drift_chain_dir: Path) -> None:
     """Spec G.9: report is not an exit-code gate: the drift chain (realized
     residual > expected) still reports exit 0 -- gating belongs to
     plan/backtest."""
-    drift_chain_dir = _run_chain(report_session, "drift_full", "drift")
     out_path = report_session / "report_drift.html"
     result = run_cli(["report", "--from", str(drift_chain_dir), "-o", str(out_path)])
     assert result.returncode == 0, result.stderr
+
+
+# --- H.4: the redesign's status, end to end through the real CLI ---
+
+
+def test_report_overconfident_chain_is_on_track(report_pair: tuple[Path, Path]) -> None:
+    """H.4.1."""
+    html = report_pair[0].read_text()
+    attrs = rh.main_attrs(html)
+    assert (attrs["data-status"], attrs["data-mode"]) == ("ok", "full")
+    assert {c["severity"] for c in rh.rendered_checks(html)} <= {"info", "pass"}
+
+
+def test_report_drift_chain_needs_attention_and_names_the_segment(
+    report_session: Path, drift_chain_dir: Path
+) -> None:
+    """H.4.2: the ratio and the worst segment are recomputed HERE from the
+    same artifacts, not hardcoded, then looked for in the rendered check."""
+    html = _report_html(report_session, drift_chain_dir, "report_drift_h4.html")
+    assert rh.main_attrs(html)["data-status"] == "attention"
+
+    policy = json.loads((drift_chain_dir / "policy.json").read_text())
+    backtest = json.loads((drift_chain_dir / "backtest.json").read_text())
+    realized_segments = backtest["strategies"]["policy"]["segments"]
+    ratio = (
+        backtest["strategies"]["policy"]["residual_loss"]
+        / backtest["expected"]["expected_residual_loss"]
+    )
+    assert ratio > ATTENTION_RESIDUAL_RATIO
+
+    def gap(name: str) -> float:
+        realized = realized_segments.get(name, {}).get("residual_loss", 0.0)
+        expected = policy["segments"].get(name, {}).get("expected_residual_loss", 0.0)
+        return float(realized - expected)
+
+    names = sorted(set(policy["segments"]) | set(realized_segments))
+    worst = min(names, key=lambda name: (-gap(name), name))
+    assert worst == "seg_high"
+
+    check = {c["id"]: c for c in rh.rendered_checks(html)}["plan.vs_actual"]
+    assert check["severity"] == "warn" and check["open"]
+    block_text = rh.text(rh.check_block(html, "plan.vs_actual"))
+    assert f"{ratio:.2f}\u00d7" in block_text
+    assert worst in block_text
+
+
+def test_report_ci_gate_chain_fails_but_report_exits_0(
+    report_session: Path, drift_gated_chain_dir: Path
+) -> None:
+    """H.4.3: backtest exits 2 (asserted while building the chain), yet the
+    report renders with exit 0 and a red status -- gating belongs to
+    plan/backtest (G.9), the report only tells the truth about it."""
+    html = _report_html(report_session, drift_gated_chain_dir, "report_drift_gated.html")
+    assert rh.main_attrs(html)["data-status"] == "failed"
+    checks = {c["id"]: c for c in rh.rendered_checks(html)}
+    assert checks["gate.max_residual_risk.realized"]["severity"] == "fail"
+    assert checks["gate.max_residual_risk.realized"]["open"]
+    assert checks["gate.max_residual_risk.planned"]["severity"] == "pass"
+    assert rh.rendered_checks(html)[0]["id"] == "gate.max_residual_risk.realized"
+
+
+def test_report_drift_plan_only_is_neutral_not_green(
+    report_session: Path, drift_chain_dir: Path
+) -> None:
+    """H.4.4: the R2-shaped case. The SAME drift plan that is "attention"
+    once replayed must not look healthy just because it wasn't checked
+    against reality."""
+    plan_only_dir = report_session / "drift_plan_only"
+    plan_only_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy(drift_chain_dir / "calibrator.json", plan_only_dir / "calibrator.json")
+    shutil.copy(drift_chain_dir / "policy.json", plan_only_dir / "policy.json")
+
+    html = _report_html(report_session, plan_only_dir, "report_drift_plan_only.html")
+    attrs = rh.main_attrs(html)
+    assert (attrs["data-status"], attrs["data-mode"]) == ("ok", "plan_only")
+    glance = rh.section(html, "at-a-glance")
+    assert "status-neutral" in glance
+    assert "status-ok" not in glance
+    assert "Plan only \u2014 not backtested" in rh.text(glance)
+
+
+# --- H.4.5: golden summaries ---
+
+GOLDEN_DIR = Path(__file__).resolve().parents[1] / "golden"
+GOLDEN_CHAINS = {
+    "overconfident": "full_chain_dir",
+    "drift": "drift_chain_dir",
+    "drift_gated": "drift_gated_chain_dir",
+}
+
+
+def summary_projection(chain_dir: Path) -> dict[str, Any]:
+    """What the golden files pin: status, mode, (id, severity) per check in
+    order, and the KPI numbers -- NOT raw HTML and NOT check wording, so a
+    copy change never touches the goldens and a logic change always does."""
+    calibrator, policy, backtest = (
+        json.loads((chain_dir / f"{name}.json").read_text())
+        for name in ("calibrator", "policy", "backtest")
+    )
+    summary = _build_summary(calibrator, policy, backtest)
+    projection = {
+        "status": summary.status,
+        "mode": summary.mode,
+        "checks": [[c.id, c.severity] for c in summary.checks],
+        "kpis": summary.kpis,
+    }
+    return json.loads(json.dumps(projection, sort_keys=True))
+
+
+@pytest.mark.parametrize("scenario", list(GOLDEN_CHAINS))
+def test_report_summary_matches_golden(scenario: str, request: pytest.FixtureRequest) -> None:
+    """H.4.5. Regenerate (deliberately, after a reviewed logic change) with:
+    `uv run python -m tests.invariants.test_report` -- it rebuilds the three
+    chains in a temp dir exactly as these fixtures do."""
+    chain_dir = request.getfixturevalue(GOLDEN_CHAINS[scenario])
+    golden = json.loads((GOLDEN_DIR / f"report_summary_{scenario}.json").read_text())
+    assert summary_projection(chain_dir) == golden
+
+
+def _regenerate_golden_summaries(out_dir: Path) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        session = Path(tmp)
+        chains = {
+            "overconfident": _run_chain(session, "overconfident_full", "overconfident"),
+            "drift": _run_chain(session, "drift_full", "drift"),
+            "drift_gated": _run_chain(
+                session,
+                "drift_gated_full",
+                "drift",
+                max_residual_risk=200000.0,
+                backtest_returncode=2,
+            ),
+        }
+        for scenario, chain_dir in chains.items():
+            path = out_dir / f"report_summary_{scenario}.json"
+            path.write_text(
+                json.dumps(summary_projection(chain_dir), sort_keys=True, indent=2) + "\n"
+            )
+            print(f"wrote {path}")
+
+
+if __name__ == "__main__":
+    _regenerate_golden_summaries(GOLDEN_DIR)

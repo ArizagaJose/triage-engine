@@ -50,6 +50,14 @@ planned-vs-replayed budget adherence row when a backtest is present. Purely
 display: the report still never exits non-zero beyond contract violations
 (pinned "no gates beyond exit 1").
 
+**Update (report v1.1, interfaces.md §11).** The panel alone still let a
+failed gate hide below the fold. The redesigned report puts the verdict
+first: a failed declared gate turns the at-a-glance status red
+("Gate failed") and its check opens at the top of the page, and a
+plan-only report (no backtest) shows a neutral "Plan only" status instead
+of green, because a plan can pass on expected numbers and still fail on
+realized ones. Still display-only; exit codes unchanged.
+
 ### R3 — ECE gate tests the point estimate, not the uncertainty
 
 The empty-split guard (F4 fix) enforces non-empty, not adequate: a holdout
@@ -58,9 +66,17 @@ CI is already computed and serialized; a stricter gate would test
 `ece_ci[1] <= max_ece` (self-adjusting to sample size, preferable to an
 arbitrary minimum-n).
 
-**Decision: deferred.** Changes pinned gate semantics (interfaces.md §4
-defines the gate on `ece_holdout`); needs an explicit spec decision.
-Revisit when calibration is next touched.
+**Decision: mitigate (v1.x), opt-in.** New `ci_upper` ECE gate mode that
+tests `ece_ci[1] <= max_ece` (the original point-estimate gate stays the
+default, exit code 3 unchanged). It is exposed as `calibrate --ece-gate-mode`
+and `gates.ece_gate_mode` in the cost YAML (interfaces.md §3, §4, §8). Unlike
+R1's overrun factor, this *is* a `Gates` field, because the report has to
+know which statistic `plan` gated on. To avoid R1's hash concern,
+`config_snapshot` omits the key when it holds the default, so default-mode
+`policy_hash`es and the committed golden fixtures are unchanged, and old
+policies (no key) read as `point`. Not made the default: every seeded
+synthetic scenario's upper bound (0.074–0.082) fails the emitted
+`max_ece: 0.05`, so a silent switch would turn passing pipelines into exit 3.
 
 ### R4 — Hash chain proves consistency, not authenticity
 

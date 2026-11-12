@@ -1,55 +1,26 @@
-"""Unit tests for the backtester (docs/interfaces.md §9).
-
-These use lightweight PredictsErrors stubs and small handcrafted polars
-frames; they never call triage.calibration, so calibrator internals stay out
-of scope here (matches the convention in tests/test_optimizer.py).
-"""
+"""Backtester (docs/interfaces.md §9), including the capacity-sweep curves
+(§9.11). IdentityCalibrator (p_error = score) and handcrafted frames keep the
+expected numbers exact and calibration out of scope."""
 
 import math
 
 import numpy as np
-import polars as pl
 import pytest
 
+from tests.support import IdentityCalibrator, history_frame
 from triage.artifacts import content_hash
 from triage.backtest import (
     BacktestResult,
     check_budget_overrun_gate,
     check_realized_residual_gate,
     run,
+    validate_max_budget_overrun,
+    validate_n_random_draws,
 )
 from triage.costs import Budget, CostModel, Gates, SegmentCosts
 from triage.exceptions import BudgetOverrunExceeded, ContractViolation, ResidualRiskExceeded
 
-
-class IdentityCalibrator:
-    """Stub satisfying PredictsErrors: p_error = score, unchanged."""
-
-    def predict(self, scores: np.ndarray) -> np.ndarray:
-        return np.asarray(scores, dtype=np.float64)
-
-
 CALIBRATOR = IdentityCalibrator()
-
-
-def _history(rows: list[tuple[str, str, float, str, str]]) -> pl.DataFrame:
-    """Build a valid history dataframe from (item_id, segment, score, predicted, true) tuples."""
-    return pl.DataFrame(
-        {
-            "item_id": [r[0] for r in rows],
-            "segment": [r[1] for r in rows],
-            "score": [r[2] for r in rows],
-            "predicted_value": [r[3] for r in rows],
-            "true_value": [r[4] for r in rows],
-        },
-        schema={
-            "item_id": pl.String,
-            "segment": pl.String,
-            "score": pl.Float64,
-            "predicted_value": pl.String,
-            "true_value": pl.String,
-        },
-    )
 
 
 def _cost_model_dict() -> dict:
@@ -115,7 +86,7 @@ def _run_main(**kwargs) -> BacktestResult:
     return run(
         _main_policy_dict(),
         CALIBRATOR,
-        _history(_main_rows()),
+        history_frame(_main_rows()),
         seed=kwargs.pop("seed", 42),
         n_random_draws=kwargs.pop("n_random_draws", 50),
         input_sha256s={"calibrator": "c" * 64, "history": "h" * 64, "policy": "p" * 64},
@@ -187,7 +158,7 @@ class TestBudgetEdgeCases:
         result = run(
             policy_dict,
             CALIBRATOR,
-            _history(_main_rows()),
+            history_frame(_main_rows()),
             seed=42,
             n_random_draws=10,
             input_sha256s={"calibrator": "c" * 64, "history": "h" * 64, "policy": "p" * 64},
@@ -220,7 +191,7 @@ class TestBudgetEdgeCases:
         result = run(
             policy_dict,
             CALIBRATOR,
-            _history(_main_rows()),
+            history_frame(_main_rows()),
             seed=42,
             n_random_draws=10,
             input_sha256s={"calibrator": "c" * 64, "history": "h" * 64, "policy": "p" * 64},
@@ -240,7 +211,7 @@ class TestPolicySelfHashCheck:
             run(
                 policy_dict,
                 CALIBRATOR,
-                _history(_main_rows()),
+                history_frame(_main_rows()),
                 seed=42,
                 n_random_draws=10,
                 input_sha256s={"calibrator": "c" * 64, "history": "h" * 64, "policy": "p" * 64},
@@ -254,7 +225,7 @@ class TestPolicySelfHashCheck:
             run(
                 policy_dict,
                 CALIBRATOR,
-                _history(_main_rows()),
+                history_frame(_main_rows()),
                 seed=42,
                 n_random_draws=10,
                 input_sha256s={"calibrator": "c" * 64, "history": "h" * 64, "policy": "p" * 64},
@@ -273,7 +244,7 @@ class TestMalformedConfigSnapshot:
             run(
                 policy_dict,
                 CALIBRATOR,
-                _history(_main_rows()),
+                history_frame(_main_rows()),
                 seed=42,
                 n_random_draws=10,
                 input_sha256s={"calibrator": "c" * 64, "history": "h" * 64, "policy": "p" * 64},
@@ -290,7 +261,7 @@ class TestMalformedConfigSnapshot:
             run(
                 policy_dict,
                 CALIBRATOR,
-                _history(_main_rows()),
+                history_frame(_main_rows()),
                 seed=42,
                 n_random_draws=10,
                 input_sha256s={"calibrator": "c" * 64, "history": "h" * 64, "policy": "p" * 64},
@@ -336,7 +307,7 @@ class TestRandomBaselineDeterminism:
     def test_std_uses_ddof_0(self) -> None:
         # Cross-check against a manual population-std computation on the same draws.
         policy_dict = _main_policy_dict()
-        history = _history(_main_rows())
+        history = history_frame(_main_rows())
         rng = np.random.default_rng(99)
         n_review = 2
         n_history = 5
@@ -488,3 +459,248 @@ class TestToDict:
         assert d["backtest_hash"] == result.backtest_hash
         # backtest_hash must equal content_hash of the dict (created_at excluded is a no-op here).
         assert content_hash(d) == result.backtest_hash
+
+
+# ---------------------------------------------------------------------------
+# Option validation (shared with `triage run`, see tests/test_run_parity.py)
+# ---------------------------------------------------------------------------
+
+
+class TestOptionValidation:
+    @pytest.mark.parametrize("n", [-1, -200])
+    def test_negative_n_random_draws_is_contract_violation(self, n: int) -> None:
+        """Used to crash inside numpy (`np.empty(-1)`) -> exit 4."""
+        with pytest.raises(ContractViolation, match="n_random_draws must be an integer >= 0"):
+            _run_main(n_random_draws=n)
+
+    def test_zero_n_random_draws_is_valid(self) -> None:
+        result = _run_main(n_random_draws=0)
+        assert result.strategies["random"]["captured_loss_mean"] == 0.0
+
+    @pytest.mark.parametrize("n", [1.5, True, "3"])
+    def test_non_integer_n_random_draws_rejected(self, n: object) -> None:
+        with pytest.raises(ContractViolation):
+            validate_n_random_draws(n)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("seed", [-1, True, 1.0])
+    def test_invalid_seed_is_contract_violation(self, seed: object) -> None:
+        with pytest.raises(ContractViolation, match="seed must be a non-negative integer"):
+            _run_main(seed=seed)
+
+    @pytest.mark.parametrize("factor", [0.99, -1.0, math.nan, math.inf, -math.inf])
+    def test_validate_max_budget_overrun_rejects(self, factor: float) -> None:
+        with pytest.raises(ContractViolation, match="finite float >= 1.0"):
+            validate_max_budget_overrun(factor)
+
+    @pytest.mark.parametrize("factor", [1.0, 1.5, 100.0])
+    def test_validate_max_budget_overrun_accepts(self, factor: float) -> None:
+        validate_max_budget_overrun(factor)
+
+
+# ---------------------------------------------------------------------------
+# Capacity-sweep curves (docs/interfaces.md §9.11). Own fixture data: two
+# segments, 6 items, values hand-computed below.
+# ---------------------------------------------------------------------------
+
+
+def _curves_cost_model_dict() -> dict:
+    return {
+        "budget": {"type": "fraction", "value": 0.10},
+        "gates": {},
+        "segments": {
+            "segA": {"false_accept_cost": 100.0, "review_cost": 10.0},
+            "segB": {"false_accept_cost": 50.0, "review_cost": 5.0},
+        },
+    }
+
+
+def _curves_policy_dict(*, segments: dict) -> dict:
+    d = {
+        "config_snapshot": _curves_cost_model_dict(),
+        "segments": segments,
+        "totals": {"expected_captured_loss": 0.0, "expected_residual_loss": 0.0},
+    }
+    d["policy_hash"] = content_hash(d)
+    return d
+
+
+_CURVES_INPUT_SHA = {"calibrator": "c" * 64, "history": "h" * 64, "policy": "p" * 64}
+
+
+# ---------------------------------------------------------------------------
+# Main fixture: 6 items across segA (fa=100, review=10) / segB (fa=50, review=5).
+#
+#   item  seg   score  p_error  predicted/true  true_loss  expected_loss  net_benefit
+#   i1    segA  0.90   0.90     x/v (error)      100          90            80
+#   i2    segA  0.10   0.10     v/v (no error)      0          10             0
+#   i3    segB  0.80   0.80     x/v (error)       50          40            35
+#   i4    segB  0.20   0.20     v/v (no error)      0          10             5
+#   i5    segA  0.50   0.50     x/v (error)      100          50            40
+#   i6    segB  0.60   0.60     v/v (no error)      0          30            25
+#
+# total_true_loss = 100+0+50+0+100+0 = 250, n_history=6.
+#
+# Policy ranking (net_benefit DESC, item_id ASC tie-break):
+#   i1(80), i5(40), i3(35), i6(25), i4(5), i2(0)
+# Raw-confidence ranking (score ASC, item_id ASC tie-break):
+#   i2(0.10), i4(0.20), i5(0.50), i6(0.60), i3(0.80), i1(0.90)
+# ---------------------------------------------------------------------------
+def _curves_rows() -> list[tuple[str, str, float, str, str]]:
+    return [
+        ("i1", "segA", 0.90, "x", "v"),
+        ("i2", "segA", 0.10, "v", "v"),
+        ("i3", "segB", 0.80, "x", "v"),
+        ("i4", "segB", 0.20, "v", "v"),
+        ("i5", "segA", 0.50, "x", "v"),
+        ("i6", "segB", 0.60, "v", "v"),
+    ]
+
+
+def _curves_run(**kwargs):
+    policy_dict = _curves_policy_dict(
+        segments={
+            "segA": {"p_error_threshold": 0.5},
+            "segB": {"p_error_threshold": 0.6},
+        }
+    )
+    return run(
+        policy_dict,
+        CALIBRATOR,
+        history_frame(_curves_rows()),
+        seed=kwargs.pop("seed", 42),
+        n_random_draws=kwargs.pop("n_random_draws", 10),
+        input_sha256s=_CURVES_INPUT_SHA,
+        tool_version="0.1.0",
+        **kwargs,
+    )
+
+
+class TestGridPinned:
+    def test_grid_is_exactly_pinned(self) -> None:
+        result = _curves_run()
+        expected_grid = [i / 100 for i in range(51)]
+        assert result.curves["grid"] == expected_grid
+
+    def test_grid_length_is_51(self) -> None:
+        result = _curves_run()
+        assert len(result.curves["grid"]) == 51
+
+    def test_series_lengths_match_grid(self) -> None:
+        result = _curves_run()
+        curves = result.curves
+        assert len(curves["policy"]) == 51
+        assert len(curves["raw_confidence"]) == 51
+        assert len(curves["random"]) == 51
+
+
+class TestMonotonicity:
+    def test_policy_curve_is_nondecreasing(self) -> None:
+        result = _curves_run()
+        series = result.curves["policy"]
+        assert all(b >= a - 1e-12 for a, b in zip(series, series[1:]))
+
+    def test_raw_confidence_curve_is_nondecreasing(self) -> None:
+        result = _curves_run()
+        series = result.curves["raw_confidence"]
+        assert all(b >= a - 1e-12 for a, b in zip(series, series[1:]))
+
+    def test_random_curve_is_nondecreasing(self) -> None:
+        result = _curves_run()
+        series = result.curves["random"]
+        assert all(b >= a - 1e-12 for a, b in zip(series, series[1:]))
+
+
+class TestRandomExactness:
+    def test_random_curve_equals_k_over_n_exactly(self) -> None:
+        result = _curves_run()
+        n_history = result.n_history
+        grid = result.curves["grid"]
+        expected = [math.floor(f * n_history) / n_history for f in grid]
+        assert result.curves["random"] == expected
+
+
+class TestHandcraftedValues:
+    """k values computed by hand for n_history=6 (see fixture docstring above)."""
+
+    def test_k_zero_endpoint_is_zero(self) -> None:
+        # grid[0] = 0.00 -> k = floor(0 * 6) = 0 for all three series.
+        result = _curves_run()
+        assert result.curves["policy"][0] == 0.0
+        assert result.curves["raw_confidence"][0] == 0.0
+        assert result.curves["random"][0] == 0.0
+
+    def test_k_one_at_f_020(self) -> None:
+        # f=0.20 (grid index 20): k = floor(0.20*6) = 1.
+        result = _curves_run()
+        idx = 20
+        assert math.floor(result.curves["grid"][idx] * 6) == 1
+        # Policy top-1 = i1 (true_loss=100) -> share 100/250 = 0.4.
+        assert result.curves["policy"][idx] == pytest.approx(100.0 / 250.0)
+        # Raw top-1 = i2 (true_loss=0) -> share 0.
+        assert result.curves["raw_confidence"][idx] == pytest.approx(0.0)
+        # Random: k/n = 1/6.
+        assert result.curves["random"][idx] == pytest.approx(1.0 / 6.0)
+
+    def test_k_three_at_f_050(self) -> None:
+        # f=0.50 (grid index 50, the last point): k = floor(0.50*6) = 3.
+        result = _curves_run()
+        idx = 50
+        assert math.floor(result.curves["grid"][idx] * 6) == 3
+        # Policy top-3 = i1, i5, i3 -> true_loss 100+100+50=250 -> share 1.0.
+        assert result.curves["policy"][idx] == pytest.approx(1.0)
+        # Raw top-3 = i2, i4, i5 -> true_loss 0+0+100=100 -> share 100/250=0.4.
+        assert result.curves["raw_confidence"][idx] == pytest.approx(100.0 / 250.0)
+        # Random: k/n = 3/6 = 0.5.
+        assert result.curves["random"][idx] == pytest.approx(0.5)
+
+
+class TestZeroCapacityAndTotalLoss:
+    def test_total_true_loss_zero_gives_all_zero_policy_and_raw_curves(self) -> None:
+        # No prediction errors anywhere -> total_true_loss == 0.
+        rows = [
+            ("z1", "segA", 0.90, "v", "v"),
+            ("z2", "segA", 0.10, "v", "v"),
+            ("z3", "segB", 0.80, "v", "v"),
+            ("z4", "segB", 0.20, "v", "v"),
+        ]
+        policy_dict = _curves_policy_dict(
+            segments={
+                "segA": {"p_error_threshold": 0.5},
+                "segB": {"p_error_threshold": 0.5},
+            }
+        )
+        result = run(
+            policy_dict,
+            CALIBRATOR,
+            history_frame(rows),
+            seed=42,
+            n_random_draws=10,
+            input_sha256s=_CURVES_INPUT_SHA,
+            tool_version="0.1.0",
+        )
+        assert result.total_true_loss == 0.0
+        assert result.curves["policy"] == [0.0] * 51
+        assert result.curves["raw_confidence"] == [0.0] * 51
+        # Random is unaffected by total_true_loss: still the analytic k/n_history.
+        n_history = result.n_history
+        expected_random = [math.floor(f * n_history) / n_history for f in result.curves["grid"]]
+        assert result.curves["random"] == expected_random
+
+
+class TestCurvesInHashAndDict:
+    def test_curves_present_in_to_dict_and_covered_by_hash(self) -> None:
+        result = _curves_run()
+        d = result.to_dict()
+        assert "curves" in d
+        assert d["curves"] == result.curves
+        assert content_hash(d) == result.backtest_hash
+
+    def test_backtest_hash_changes_if_curves_would_differ(self) -> None:
+        # Sanity: curves participate in the hashed content (content_hash does
+        # not special-case "curves" the way it does created_at/policy_hash).
+        result = _curves_run()
+        d = result.to_dict()
+        tampered = dict(d)
+        tampered["curves"] = dict(d["curves"])
+        tampered["curves"]["policy"] = [0.0] * 51
+        assert content_hash(tampered) != result.backtest_hash

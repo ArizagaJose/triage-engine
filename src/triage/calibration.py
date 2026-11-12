@@ -6,7 +6,7 @@ round-trips are bit-exact.
 """
 
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Literal, NamedTuple
 
 import numpy as np
 import polars as pl
@@ -14,7 +14,7 @@ from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 
 from triage import __version__
-from triage.contract import validate
+from triage.contract import validate, validate_seed
 from triage.exceptions import CalibrationGateFailed, ContractViolation
 
 
@@ -229,6 +229,7 @@ def fit(
     Returns Calibrator with fitted isotonic or Platt scaling, ECE on holdout,
     bootstrap CI, and reliability bins for both raw and calibrated predictions.
     """
+    validate_seed(seed)
     golden = validate(golden, require_truth=True)
 
     item_ids = golden["item_id"].to_list()
@@ -385,10 +386,59 @@ def _bootstrap_ece_ci(
     return (lo, hi)
 
 
-def check_ece_gate(calibrator: Calibrator, max_ece: float) -> None:
-    """Check if calibrator's ECE exceeds gate; raise CalibrationGateFailed if so."""
-    if calibrator.ece_holdout > max_ece:
+# ECE gate modes (docs/interfaces.md §4). "point" is the default and the
+# original semantics; "ci_upper" gates on the upper bound of the bootstrap CI
+# that `fit` already computes, so a small holdout cannot pass on a lucky
+# point estimate (docs/risk-register.md R3).
+EceGateMode = Literal["point", "ci_upper"]
+ECE_GATE_MODES: tuple[EceGateMode, ...] = ("point", "ci_upper")
+DEFAULT_ECE_GATE_MODE: EceGateMode = "point"
+
+
+class EceGateStatistic(NamedTuple):
+    """The ECE statistic a gate mode compares against `max_ece`."""
+
+    name: str  # "ece_holdout" | "ece_ci_upper"
+    description: str  # human-readable, names the artifact field
+    value: float
+
+
+def ece_gate_statistic(calibrator: Calibrator, mode: str) -> EceGateStatistic:
+    """Return the statistic the ECE gate compares against `max_ece` under `mode`.
+
+    Raises ContractViolation for an unknown mode (modes come from user input:
+    the cost YAML or the `--ece-gate-mode` flag).
+    """
+    if mode == "point":
+        return EceGateStatistic(
+            "ece_holdout", "point estimate, calibrator.ece_holdout", calibrator.ece_holdout
+        )
+    if mode == "ci_upper":
+        level = f"{calibrator.config.ci_level * 100:g}%"
+        return EceGateStatistic(
+            "ece_ci_upper",
+            f"upper bound of the {level} bootstrap CI, calibrator.ece_ci[1]",
+            calibrator.ece_ci[1],
+        )
+    raise ContractViolation(
+        f"Unknown ECE gate mode {mode!r}; expected one of {', '.join(ECE_GATE_MODES)}"
+    )
+
+
+def check_ece_gate(
+    calibrator: Calibrator, max_ece: float, mode: str = DEFAULT_ECE_GATE_MODE
+) -> None:
+    """Raise CalibrationGateFailed if the gated ECE statistic exceeds `max_ece`.
+
+    mode="point" (default) gates on `ece_holdout`; mode="ci_upper" gates on
+    `ece_ci[1]`. The comparison is strict in both modes: a value exactly equal
+    to `max_ece` passes.
+    """
+    stat = ece_gate_statistic(calibrator, mode)
+    if stat.value > max_ece:
         raise CalibrationGateFailed(
-            f"Calibration quality gate failed: ece_holdout={calibrator.ece_holdout!r} "
-            f"exceeds max_ece={max_ece!r}"
+            f"Calibration quality gate failed (ece_gate_mode={mode}): "
+            f"{stat.name}={stat.value!r} ({stat.description}) exceeds max_ece={max_ece!r}; "
+            f"ece_holdout={calibrator.ece_holdout!r}, "
+            f"ece_ci=({calibrator.ece_ci[0]!r}, {calibrator.ece_ci[1]!r})"
         )

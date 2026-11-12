@@ -128,3 +128,6 @@ dmypy.json
 # Project-specific
 artifacts/
 data/
+
+# scripts/demo_report.sh output
+demo/

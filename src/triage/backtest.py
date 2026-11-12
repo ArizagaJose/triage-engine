@@ -49,7 +49,33 @@ __all__ = [
     "run",
     "check_realized_residual_gate",
     "check_budget_overrun_gate",
+    "validate_n_random_draws",
+    "validate_max_budget_overrun",
 ]
+
+
+def validate_n_random_draws(n_random_draws: int) -> None:
+    """n_random_draws must be an integer >= 0 (0 = no random draws; the
+    random baseline then reports zeros). Negative counts used to crash inside
+    numpy (exit 4) instead of being reported as a contract violation."""
+    if (
+        isinstance(n_random_draws, bool)
+        or not isinstance(n_random_draws, int)
+        or n_random_draws < 0
+    ):
+        raise ContractViolation(f"n_random_draws must be an integer >= 0, got {n_random_draws!r}")
+
+
+def validate_max_budget_overrun(max_budget_overrun: float) -> None:
+    """The --max-budget-overrun FACTOR must be a finite float >= 1.0."""
+    # NaN/inf must be rejected explicitly: `nan < 1.0` is False, and both
+    # `actual > nan` and `actual > inf` are False, so a non-finite factor
+    # would silently disable the gate instead of gating.
+    if not math.isfinite(max_budget_overrun) or max_budget_overrun < 1.0:
+        raise ContractViolation(
+            f"--max-budget-overrun must be a finite float >= 1.0, got {max_budget_overrun}"
+        )
+
 
 # Capacity-sweep grid: review fractions 0.00 ... 0.50 in steps of 0.01 (§9.11).
 _CURVE_GRID: list[float] = [i / 100 for i in range(51)]
@@ -124,6 +150,9 @@ def run(
 
     See docs/interfaces.md §9 for the pinned semantics.
     """
+    contract.validate_seed(seed)
+    validate_n_random_draws(n_random_draws)
+
     # 1. Policy self-check: the artifact must hash to its own declared policy_hash.
     declared_hash = _require(policy_dict, "policy_hash", context="policy")
     computed_hash = content_hash(policy_dict)
@@ -350,13 +379,7 @@ def check_budget_overrun_gate(
     """Raise BudgetOverrunExceeded if replayed capacity exceeds --max-budget-overrun."""
     if max_budget_overrun is None:
         return
-    # NaN/inf must be rejected explicitly: `nan < 1.0` is False, and both
-    # `actual > nan` and `actual > inf` are False, so a non-finite factor
-    # would silently disable the gate instead of gating.
-    if not math.isfinite(max_budget_overrun) or max_budget_overrun < 1.0:
-        raise ContractViolation(
-            f"--max-budget-overrun must be a finite float >= 1.0, got {max_budget_overrun}"
-        )
+    validate_max_budget_overrun(max_budget_overrun)
     budget = cost_model.budget
     policy_strategy = result.strategies["policy"]
     if budget.type == "fraction":

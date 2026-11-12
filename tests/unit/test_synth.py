@@ -1,4 +1,4 @@
-"""Unit tests for the synthetic data generator."""
+"""Synthetic scenarios, including drift (docs/interfaces.md §6)."""
 
 import json
 from pathlib import Path
@@ -6,6 +6,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+from triage import contract, costs, synth
 from triage.exceptions import ContractViolation
 from triage.synth import generate, write
 
@@ -223,8 +224,111 @@ def test_unknown_scenario_raises_contract_violation() -> None:
     message = str(exc_info.value)
     assert "well_calibrated" in message
     assert "overconfident" in message
+    assert "drift" in message
 
 
 def test_unknown_scenario_raises_on_write(tmp_path: Path) -> None:
     with pytest.raises(ContractViolation):
         write("bogus", seed=42, out_dir=tmp_path / "out")
+
+
+@pytest.mark.parametrize("seed", [-1, -42])
+def test_negative_seed_is_contract_violation(seed: int) -> None:
+    """np.random.default_rng rejects negative seeds with ValueError (exit 4);
+    it must surface as an input contract violation (exit 1) instead."""
+    with pytest.raises(ContractViolation, match="seed must be a non-negative integer"):
+        generate("drift", seed=seed)
+
+
+def test_unknown_scenario_checked_before_seed() -> None:
+    with pytest.raises(ContractViolation, match="Unknown scenario 'nope'"):
+        generate("nope", seed=-1)
+
+
+# --- drift scenario (docs/interfaces.md §6) ---
+
+
+def test_drift_golden_equals_well_calibrated_golden_same_seed() -> None:
+    drift = generate("drift", seed=42)
+    well = generate("well_calibrated", seed=42)
+    drift_golden = drift["golden"]
+    well_golden = well["golden"]
+    assert isinstance(drift_golden, pl.DataFrame)
+    assert isinstance(well_golden, pl.DataFrame)
+    assert drift_golden.equals(well_golden)
+
+
+def test_drift_batch_differs_from_well_calibrated_batch() -> None:
+    # Same rng consumption order and same score formula, but drifted error
+    # probabilities mean the error/predicted_value columns (and hence the
+    # frame) diverge on the batch split.
+    drift = generate("drift", seed=42)
+    well = generate("well_calibrated", seed=42)
+    drift_batch = drift["batch"]
+    well_batch = well["batch"]
+    assert isinstance(drift_batch, pl.DataFrame)
+    assert isinstance(well_batch, pl.DataFrame)
+    assert not drift_batch.equals(well_batch)
+    # But item_id and score columns are identical (rng order + score formula unchanged).
+    assert drift_batch["item_id"].to_list() == well_batch["item_id"].to_list()
+    assert drift_batch["score"].to_list() == well_batch["score"].to_list()
+    assert drift_batch["segment"].to_list() == well_batch["segment"].to_list()
+
+
+def test_drift_batch_error_rate_approx_double_undrifted_mean() -> None:
+    # Undrifted analytic means: seg_high (0.01+0.30)/2=0.155, seg_mid
+    # (0.02+0.40)/2=0.21, seg_low (0.05+0.50)/2=0.275. Doubled (drift_factor=2.0,
+    # capped at 0.95, which none of these hit): 0.31 / 0.42 / 0.55.
+    expected_doubled = {"seg_high": 0.31, "seg_mid": 0.42, "seg_low": 0.55}
+
+    data = generate("drift", seed=42)
+    batch = data["batch"]
+    assert isinstance(batch, pl.DataFrame)
+
+    err = batch.with_columns(
+        (pl.col("predicted_value") != pl.col("true_value")).cast(pl.Float64).alias("error")
+    )
+    per_seg = err.group_by("segment").agg(pl.col("error").mean().alias("mean_error"))
+    rates = dict(zip(per_seg["segment"].to_list(), per_seg["mean_error"].to_list(), strict=True))
+
+    for seg, expected in expected_doubled.items():
+        assert abs(rates[seg] - expected) < 0.03, (seg, rates[seg], expected)
+
+
+def test_manifest_has_drift_factor_2_for_drift_scenario() -> None:
+    data = generate("drift", seed=42)
+    manifest = data["manifest"]
+    assert isinstance(manifest, dict)
+    assert manifest["drift_factor"] == 2.0
+    assert manifest["scenario"] == "drift"
+
+
+@pytest.mark.parametrize("scenario", ["well_calibrated", "overconfident"])
+def test_manifest_has_null_drift_factor_for_non_drift_scenarios(scenario: str) -> None:
+    data = generate(scenario, seed=42)
+    manifest = data["manifest"]
+    assert isinstance(manifest, dict)
+    assert "drift_factor" in manifest
+    assert manifest["drift_factor"] is None
+
+
+# --- generated data satisfies the input contract and the cost model ---
+
+
+@pytest.mark.parametrize("scenario", ["well_calibrated", "overconfident"])
+def test_synth_output_passes_contract(scenario: str) -> None:
+    data = synth.generate(scenario, seed=42)
+    for key in ("golden", "batch"):
+        df = data[key]
+        assert contract.validate(df, require_truth=True) is not None  # type: ignore[arg-type]
+
+
+def test_emitted_costs_yaml_loads_and_files_round_trip(tmp_path: Path) -> None:
+    synth.write("overconfident", seed=42, out_dir=tmp_path)
+    cost_model = costs.load(tmp_path / "costs.yaml")
+    assert cost_model.budget.type == "fraction"
+    assert cost_model.budget.value == 0.10
+    assert cost_model.gates.max_ece == 0.05
+    for name in ("golden.parquet", "batch.parquet"):
+        df = contract.read_input(tmp_path / name, require_truth=True)
+        assert df.height > 0
