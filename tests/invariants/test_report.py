@@ -18,6 +18,7 @@ so that directory can be passed straight to `triage report --from`.
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -532,6 +533,39 @@ def summary_projection(chain_dir: Path) -> dict[str, Any]:
     return json.loads(json.dumps(projection, sort_keys=True))
 
 
+def assert_summary_matches_golden(actual: Any, expected: Any, path: str = "summary") -> None:
+    """Compare structure exactly, allowing eight ULPs for report KPI floats.
+
+    Platt fitting uses BLAS: Haswell and Sandybridge kernels reproduce the
+    runner's last-bit differences even with identical seeds and dependencies.
+    This display-summary check must not impose cross-CPU bitwise equivalence;
+    the separate artifact determinism tests still compare exact content.
+    """
+    assert type(actual) is type(expected), path
+    if isinstance(expected, dict):
+        assert actual.keys() == expected.keys(), path
+        for key, value in expected.items():
+            assert_summary_matches_golden(actual[key], value, f"{path}.{key}")
+    elif isinstance(expected, list):
+        assert len(actual) == len(expected), path
+        for index, value in enumerate(expected):
+            assert_summary_matches_golden(actual[index], value, f"{path}[{index}]")
+    elif isinstance(expected, float):
+        assert math.isfinite(actual) and math.isfinite(expected), path
+        assert abs(actual - expected) <= 8 * math.ulp(expected), path
+    else:
+        assert actual == expected, path
+
+
+def test_summary_golden_comparison_accepts_only_last_bit_float_noise() -> None:
+    expected = {"status": "attention", "count": 1000, "value": 142706.27376309276}
+    actual = {**expected, "value": 142706.27376309264}
+    assert_summary_matches_golden(actual, expected)
+    for changed in ({"status": "ok"}, {"count": 1001}, {"value": expected["value"] + 1e-6}):
+        with pytest.raises(AssertionError):
+            assert_summary_matches_golden({**expected, **changed}, expected)
+
+
 @pytest.mark.parametrize("scenario", list(GOLDEN_CHAINS))
 def test_report_summary_matches_golden(scenario: str, request: pytest.FixtureRequest) -> None:
     """H.4.5. Regenerate (deliberately, after a reviewed logic change) with:
@@ -539,7 +573,7 @@ def test_report_summary_matches_golden(scenario: str, request: pytest.FixtureReq
     chains in a temp dir exactly as these fixtures do."""
     chain_dir = request.getfixturevalue(GOLDEN_CHAINS[scenario])
     golden = json.loads((GOLDEN_DIR / f"report_summary_{scenario}.json").read_text())
-    assert summary_projection(chain_dir) == golden
+    assert_summary_matches_golden(summary_projection(chain_dir), golden)
 
 
 def _regenerate_golden_summaries(out_dir: Path) -> None:
