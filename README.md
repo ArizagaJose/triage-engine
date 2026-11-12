@@ -242,4 +242,4 @@ document-level review.
 
 ## License
 
-MIT (placeholder — LICENSE file TBD).
+[MIT License](LICENSE).

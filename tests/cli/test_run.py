@@ -19,6 +19,8 @@ from typing import Any
 
 import pytest
 import yaml
+from rich.text import Text
+from typer import rich_utils
 
 from tests.support import (
     GOLDEN_DIR,
@@ -597,10 +599,16 @@ def test_output_that_is_a_file_is_rejected(cli: Any, tmp_path: Path) -> None:
     assert "is not a directory" in result.stderr
 
 
-def test_run_help_lists_its_options(cli: Any) -> None:
+@pytest.mark.parametrize("force_terminal", [False, True])
+def test_run_help_lists_its_options(
+    cli: Any, monkeypatch: pytest.MonkeyPatch, force_terminal: bool
+) -> None:
+    monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", force_terminal)
     result = ok(cli.argv(["run", "--help"]))
+    # Rich may style the dashes separately from the option name in CI.
+    help_text = Text.from_ansi(result.stdout).plain
     for flag in ("--scenario", "--golden", "--ece-gate-mode", "--fail-fast"):
-        assert flag in result.stdout
+        assert flag in help_text
 
 
 # --- 4. Drift guards: every stage parameter is forwarded -----------------------------
