@@ -1,0 +1,43 @@
+{#- Template macros shared by report.html.j2 and compare.html.j2. -#}
+{% macro audit_section(short_chain, hash_rows) -%}
+<section id="audit">
+  <h2>Audit trail</h2>
+  <details class="audit">
+    <summary>
+      &#9656; {% for label, h in short_chain %}{{ label }} <code class="hash">{{ h[:10] }}</code>{% if not loop.last %}<span class="arrow">&rarr;</span>{% endif %}{% endfor %}
+    </summary>
+    <div class="dbody">
+      <table class="tbl">
+        {% for label, value in hash_rows %}
+        <tr><td>{{ label }}</td><td><code class="hash">{{ value }}</code></td></tr>
+        {% endfor %}
+      </table>
+    </div>
+  </details>
+</section>
+{%- endmacro %}
+
+{#- Status pill: `color` is ok|attention|failed|neutral (§11.6). -#}
+{% macro status_badge(color, label) -%}
+<span class="status-badge status-{{ color }}">
+    <span class="dot"></span>{{ label }}
+  </span>
+{%- endmacro %}
+
+{#- CI-style checks list (§11.5): each check has id, severity, title, detail, value, section. -#}
+{% macro checks_list(checks, severity_icon) -%}
+<div class="checks">
+    {% for c in checks %}
+    <details class="check {{ c.severity }}" data-check-id="{{ c.id }}" data-severity="{{ c.severity }}"
+              {% if c.severity in ("fail", "warn") %}open{% endif %}>
+      <summary>
+        <span class="sev-icon {{ c.severity }}">{{ severity_icon[c.severity] }}</span>
+        <span class="val">{{ c.value }}</span>
+        <a class="evidence-link" href="#{{ c.section }}">evidence &#9656;</a>
+        <div class="t">{{ c.title }}</div>
+      </summary>
+      <div class="dbody">{{ c.detail }}</div>
+    </details>
+    {% endfor %}
+  </div>
+{%- endmacro %}

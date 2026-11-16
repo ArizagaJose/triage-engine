@@ -600,3 +600,23 @@ def _regenerate_golden_summaries(out_dir: Path) -> None:
 
 if __name__ == "__main__":
     _regenerate_golden_summaries(GOLDEN_DIR)
+
+
+# --- G.10: table shape guard ---
+
+
+@pytest.mark.parametrize("with_backtest", [True, False])
+def test_report_tables_are_rectangular(
+    full_chain_dicts: dict[str, Any], with_backtest: bool
+) -> None:
+    """G.10: every table row spans as many columns as its header. A stray cell
+    once shifted every per-segment value one column right of its heading."""
+    html = render(
+        full_chain_dicts["calibrator"],
+        full_chain_dicts["policy"],
+        full_chain_dicts["backtest"] if with_backtest else None,
+        created_at="2000-01-01T00:00:00+00:00",
+        tool_version="0.1.0",
+    )
+    for widths in rh.table_shapes(html):
+        assert len(set(widths)) == 1, widths

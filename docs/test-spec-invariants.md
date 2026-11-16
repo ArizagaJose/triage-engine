@@ -1,21 +1,25 @@
-# Invariant test spec (Stage 4 + Stage 5/v1)
+# Invariant test spec (Stage 4 + Stage 5/v1 + v1.x)
 
-Author: auditor; now owned by the repository owner. Changes to this file and
-to the test files it defines (`tests/invariants/`) need the owner's approval.
-Assertions and tolerances are pinned below (see "Rules").
+Author: auditor; now maintained by the repository owner alongside the code.
+Assertions and tolerances are pinned below (see "Rules"). Changing one is a
+deliberate spec change: update this file and the test in the same change,
+and say why.
 
-## Where these tests live (owner-approved restructure)
+## Where these tests live
 
 The sections below were originally implemented as eight files at the
-`tests/` root. They are now four files, one per concern, with every claim
+`tests/` root. They are now five files, one per concern, with every claim
 assertion carried over verbatim:
 
 | spec sections | file |
 |---|---|
-| A, D | `tests/invariants/test_determinism.py` |
-| B, E | `tests/invariants/test_golden.py` |
-| C, F, G.1–4 | `tests/invariants/test_claims.py` |
-| G.5–9 (+ gates panel) | `tests/invariants/test_report.py` |
+| A, D, I.6 | `tests/invariants/test_determinism.py` |
+| B, E, I.7 | `tests/invariants/test_golden.py` |
+| C, F, G.1–4, I.2–5 | `tests/invariants/test_claims.py` |
+| G.5–10 (+ gates panel) | `tests/invariants/test_report.py` |
+| I.1 | `tests/unit/test_optimizer.py` (property tests) |
+| J (policy comparison) | `tests/invariants/test_compare.py` |
+| K (review queue) | `tests/invariants/test_review_queue.py` |
 
 Shared setup (`tests/conftest.py`, `tests/support.py`):
 
@@ -36,6 +40,10 @@ Shared setup (`tests/conftest.py`, `tests/support.py`):
   therefore in separate processes, with independent hash seeds.
 - The seed-43 calibrator of A.4, D.4 and G.7 is one shared fixture
   (`calibrator_seed43`, fitted on overconfident/42's golden set).
+- The money-budget demo of section I is one shared fixture (`money_demo`):
+  overconfident/42's batch and calibrator, the README's widened review
+  costs, a `prefix` and a `fill` policy, and a backtest of each. Read-only,
+  like the chains.
 
 ## A. Determinism (`tests/invariants/test_determinism.py`)
 
@@ -255,6 +263,11 @@ Report (`triage report`):
    `fig-coverage`; with backtest.json present the note is absent.
 9. Report is not an exit-code gate: the drift chain (realized residual >
    expected) still reports exit 0 — gating belongs to plan/backtest.
+10. Table shape (v1.x): in the report rendered from the overconfident/42
+    chain, full AND plan-only, every `<table>` row spans exactly as many
+    columns as every other row of that table (colspans counted). Guards the
+    fixed per-segment bug, where each data row had one stray empty cell
+    that shifted every value one column right of its heading.
 
 ## H. Report redesign — at-a-glance, checks, KPIs (interfaces.md §11 v1.1;
 ## new file `tests/test_report_summary.py`; updates to `tests/unit/test_report.py`
@@ -435,6 +448,84 @@ on the fly so chain checks pass by construction). Assert on `Summary.status`,
    `tests/golden/policy.json` — a wording change never touches these, a
    logic change always does.
 
+## I. Money-budget `fill` strategy (interfaces.md §5, opt-in)
+
+Setup for I.2–I.6 (`money_demo`, session-scoped, through the REAL CLI): the
+overconfident seed-42 chain's `batch.parquet` and `calibrator.json`; its
+emitted costs.yaml with `budget: {type: money, value: 1000.0}` and review
+costs widened to seg_high 45, seg_mid 3, seg_low 1, default 3 (the README
+"Money budgets" example); `plan` once as is (`prefix`) and once with
+`--budget-strategy fill`; `backtest` each against the same batch, seed 42.
+
+1. **Property tests** (hypothesis, `derandomize=True`, `plan()` with the
+   identity calibrator). Random instances with at most 9 items over 3
+   segments, distinct scores within a segment, scores `k/1024`, integer
+   false-accept costs and review costs / budgets in multiples of 0.25 (all
+   sums exact in float64, so no tolerance is needed). For each instance
+   plan both strategies and reconstruct each routed set from the published
+   thresholds (`p_error >= threshold`, per segment). Assert:
+   1. the reconstruction has exactly the policy's per-segment `n_review`
+      (per-segment prefix: threshold replay is exact for both strategies);
+   2. every routed item has `net_benefit > 0`;
+   3. `fill` spend `<= budget.value`;
+   4. total net benefit: `fill >= prefix`;
+   5. `fill >= OPT / 2`, where OPT is the brute-force 0/1 knapsack optimum
+      over all subsets (and, sanity, `fill <= OPT`);
+   6. `allocation.selected_candidate` is `net_benefit` or
+      `net_benefit_per_cost`; `prefix` policies have no `allocation` key.
+2. **Pinned demo numbers** (the README and risk-register R6 quote them):
+   `prefix` plans `n_review = 22` with expected captured loss 3527.3;
+   `fill` plans 630, expected captured loss 7587.2, review spend exactly
+   1000.0, `selected_candidate = net_benefit_per_cost`. Backtest captured
+   loss: `prefix` 7000.0, `fill` 7220.0 (sums of integer costs: exact).
+   If a number moves, update the README and R6 with it; do not loosen.
+3. **Never worse on the real batch**: `expected_captured_loss -
+   review_spend` of `fill` >= that of `prefix`, for money budgets
+   100, 1000, 4000 and 10010 (plans through `optimizer.plan`, same inputs).
+4. **Near the LP bound** (the interfaces.md §5 claim): for the same four
+   budgets, `fill`'s expected net benefit is within 0.1% of the
+   fractional-knapsack upper bound, computed independently in the test
+   from `calibrator.predict`, the costs and the budget (items with
+   `net_benefit > 0` and `review_cost <= budget`, ranked by
+   `net_benefit / review_cost`, the last one taken fractionally).
+5. **Threshold replay of a `fill` policy**: per segment, the planned
+   `n_review` lies between the count of batch items with `p_error >
+   threshold` and the count with `p_error >= threshold` (ties only), and
+   the backtest's replayed per-segment `n_review` equals the `>=` count.
+6. **Determinism**: the `fill` plan run in a fresh console-script process
+   produces a policy.json identical to the shared one after removing
+   `created_at`, and `policy_hash == content_hash(policy)`.
+7. **Default unchanged**: re-planning the B fixture's chain with an
+   explicit `--budget-strategy prefix` reproduces `tests/golden/policy.json`
+   exactly (minus `created_at`): the flag and the new schema fields leave
+   default policies byte-identical.
+
+
+## J. Policy comparison (v1.x — interfaces.md §14; `tests/invariants/test_compare.py`)
+
+Setup: the shared overconfident/42 chain is the CURRENT policy; the
+CANDIDATE is the same batch/calibrator/costs planned at `--budget 0.15`.
+`compare --n-bootstrap 500` (default seed 42), history = the chain's batch.
+
+1. Determinism: `compare` in-process and in a fresh console-script process
+   → `comparison.json` identical after removing the `created_at` line
+   (bootstrap CI included); `comparison_hash == content_hash(parsed)`.
+2. `report --compare` on the same comparison directory in-process and in a
+   fresh process → byte-identical HTML after removing the single
+   `id="created-at"` line.
+3. Identities on the real chain: each side's `residual_loss ==
+   total_true_loss - captured_loss` exactly; `delta.<k> == candidate.<k> -
+   current.<k>` exactly for captured/residual/n_review/spend/total_cost;
+   `delta.captured_loss == candidate_only.captured_loss -
+   current_only.captured_loss` within `1e-9 * max(1, total_true_loss)`;
+   the captured-loss point delta lies inside its bootstrap CI.
+4. Table shape: every table of the comparison page is rectangular (as G.10).
+
+Behavioural coverage of §14 (known improvements and regressions, budgets,
+incompatible costs, eval-costs verdict flip, segments missing from one
+policy, relationship errors, gate exit 6) lives in `tests/unit/test_compare.py`,
+`tests/unit/test_compare_report.py` and `tests/cli/test_compare.py`.
+
 ## Rules for the implementing agent
 
 - Except for the explicit H.4.5 report-snapshot float allowance, no assertion
@@ -444,3 +535,83 @@ on the fly so chain checks pass by construction). Assert on `Summary.status`,
 - Use `tmp_path` fixtures; never write into the repo tree.
 - Shared chains (`chain(...)`) are read-only; write into `tmp_path` or a
   `Chain.copy_to()` copy. The session fails if a shared chain changes.
+
+## K. Review queue export (v1.x — `tests/invariants/test_review_queue.py`)
+
+Contract: interfaces.md §10. Everything runs through the REAL CLI (`plan
+--queue-csv --queue-parquet`, and `run --queue-format`) on the shared chains,
+writing into `tmp_path` only. Every numeric comparison is EXACT (`==`). The
+queue exists to be reconciled, so no tolerance is permitted anywhere in this
+section. The shared helpers `assert_queue_reconciles` and
+`reference_allocation` live in `tests/support.py`. The reference is an
+independent re-implementation of §5: one tuple-key sort and its own capacity
+walk, without calling the optimizer.
+
+Measured values (auditor's numbers, reproduced): overconfident @ 42 plans
+1000 reviews and threshold replay admits 1183 (280 seg_high items exactly at
+the threshold, 97 of them planned). well_calibrated @ 7 (the golden chain)
+plans 1000 and replay admits 1044.
+
+1. **The tie case.** For overconfident/42 and well_calibrated/7:
+   `n_rows == totals.n_review == 1000`. The threshold-replayed set on the
+   batch has exactly the measured size, which EQUALS the chain's
+   `backtest.json` `strategies.policy.n_review`. The queue is a STRICT
+   subset of that set. Every replayed-but-not-queued item has `p_error`
+   exactly equal to its segment's threshold. Within each segment's tied
+   group, the queued items are the lowest `item_id`s, and the group is
+   genuinely cut (`0 < queued < group`).
+2. **Independent recomputation** (overconfident/42, well_calibrated/7,
+   drift/42): the queue equals the reference selection row for row
+   (`item_id`, `segment`, `p_error`, `expected_loss`, `review_cost`,
+   `net_benefit`, all float-identical), with priorities `1..n`. Residuals,
+   which the queue alone cannot determine, reconcile from queue + batch: the
+   per-segment fsum over non-queued items equals `expected_residual_loss`,
+   and the sequential sum equals the total.
+3. **Exact reconciliation** (same three chains): `assert_queue_reconciles`
+   holds on BOTH the CSV (read with the pinned dtypes) and the Parquet, and
+   the two frames are equal. `policy_hash` column == `content_hash(policy)`
+   == the chain's no-export `policy_hash`. `batch_sha256` column ==
+   `file_sha256(batch)`. Manifest: `policy_hash`, `input_sha256s` and the
+   `totals` subset equal the policy's; `n_rows`, `columns`; `queue_hash`
+   equal for the CSV and Parquet frames; each `files[*].sha256` equals the
+   file on disk; `gates == {"status": "pass", "failed": []}`.
+4. **Every budget type, end to end** (overconfident/42 inputs, patched cost
+   YAML): fraction 0.10 → 1000; fraction 0.00001 → 0; count 250 → 250;
+   count 20000 (capped at n_batch, then stopped by `net_benefit > 0`);
+   money 1000.0 → 250 (seg_high reviews cost 4.0, exact fit); money 1003.5
+   → 250; money 3.0 → 0 (below the first ranked item's cost, no
+   skip-ahead); review_cost 1e6 everywhere → 0. Each case: reconciles,
+   equals the reference, CSV == Parquet, manifest `n_rows`/`policy_hash`
+   match. An empty queue is a header-only CSV plus a zero-row Parquet with
+   the pinned schema. The stopping rule is checked from the queue's own
+   numbers: money → spend ≤ value, and if the next ranked item is worth
+   reviewing, it would overflow. Count/fraction → `n ≤ capacity`, and
+   `n == capacity` unless the next ranked item has `net_benefit ≤ 0`.
+5. **Non-regression**: `plan` with export on the golden chain reproduces
+   `tests/golden/policy.json` (minus `created_at`). `run --scenario
+   well_calibrated --seed 7 --queue-format csv --queue-format parquet`
+   reproduces BOTH golden fixtures. The committed fixtures are never
+   regenerated for this feature.
+6. **Determinism**: in-process vs console-script subprocess → both queue
+   files are byte-identical and the manifests are equal minus `created_at`.
+   A row-shuffled batch yields the same queue apart from the two trace
+   columns, which change because the batch FILE changed: `batch_sha256` is
+   the shuffled file's hash. Policy `segments`, `totals`, `budget` and
+   `config_snapshot` are equal.
+7. **Gate record agrees with the exit code** (drift/42): with
+   `max_residual_risk: 200000`, plan exits 0 and records `pass` (F.7: plan
+   passes on expected numbers, backtest is what fails). With 100000 it exits
+   2 and records `["max_residual_risk"]`. Adding `ci_upper` makes it exit 3
+   and record `["max_ece", "max_residual_risk"]` (both evaluated, the first
+   sets the exit code). The queue reconciles in every case (artifact-first).
+
+Unit and CLI coverage that this section relies on, without repeating it:
+`tests/unit/test_optimizer.py` (hand-computed queues, ties within and across
+segments, money stop rule, three empty selections, full-precision floats,
+and two `derandomize=True` property tests: a general one over all budget
+types, and a tied-group cut that always places capacity inside a tie);
+`tests/unit/test_review_queue.py` (writers, `queue_hash`, `GateStatus`,
+manifest); `tests/cli/test_commands.py` (`plan` export, the gate matrix
+compared against a plan without export, and the `_plan_preflight`
+rejections); and `tests/cli/test_run.py` (`--queue-format`, matching the
+manual commands, stale files, own-data mode, `--fail-fast`).

@@ -10,7 +10,14 @@ from typing import Any
 
 import pytest
 
-from tests.support import ChainCache, CliResult, args, run_in_process, run_subprocess
+from tests.support import (
+    ChainCache,
+    CliResult,
+    MoneyDemo,
+    args,
+    run_in_process,
+    run_subprocess,
+)
 
 
 class Cli:
@@ -58,3 +65,11 @@ def calibrator_seed43(chain: ChainCache, tmp_path_factory: pytest.TempPathFactor
     result = run_in_process(args("calibrate", golden=chain("overconfident").golden, seed=43, o=out))
     assert result.returncode == 0, result.stderr
     return out
+
+
+@pytest.fixture(scope="session")
+def money_demo(chain: ChainCache, tmp_path_factory: pytest.TempPathFactory) -> MoneyDemo:
+    """The README "Money budgets" example (test-spec section I): prefix and
+    fill policies on overconfident/42 with a money budget, each backtested.
+    Read-only."""
+    return MoneyDemo.build(chain("overconfident"), tmp_path_factory.mktemp("money") / "demo")

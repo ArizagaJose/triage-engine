@@ -68,6 +68,7 @@ Strict validation, fail-fast, exit code 1 on violation. No silent coercion.
 budget:
   type: fraction        # fraction | count | money
   value: 0.10
+  # strategy: prefix    # optional, money budgets only: prefix (default) | fill
 gates:
   max_residual_risk: 250.0   # exit code 2 if exceeded
   max_ece: 0.05              # exit code 3 if exceeded
@@ -90,11 +91,27 @@ The business declares costs; the engine executes them. No costs hardcoded.
 
 - Expected loss per item = calibrated P(error) × segment `false_accept_cost`.
 - Sort by expected loss descending (net of review cost), route to review until
-  budget is exhausted. With independent items, greedy is optimal — nothing
-  fancier is needed or wanted.
+  budget is exhausted. With fraction or count budgets every review costs one
+  unit, so with independent items greedy is optimal and nothing fancier is
+  needed.
+- Money budgets are different: review costs vary by segment, so the problem
+  is a knapsack and the default walk (stop at the first item that does not
+  fit) can leave budget unused that cheaper items would fill. The opt-in
+  `budget.strategy: fill` (`--budget-strategy fill`) skips items that do not
+  fit and keeps the better of two deterministic greedy rankings (net benefit,
+  and net benefit per unit of review cost). It is never worse than the
+  default, is at least half of the optimum, and keeps per-segment thresholds
+  exact (docs/interfaces.md §5, docs/risk-register.md R5). The default is
+  unchanged.
 - Output: `policy.json` containing per-segment thresholds, expected
   coverage/risk numbers, sha256 of inputs, tool version, config snapshot, and a
   `policy_hash` over semantic content. Same inputs → same policy, always.
+- Optional (v1.x): the exact review queue behind the policy, exported as
+  CSV and/or Parquet with a `review_queue.json` manifest. It is the
+  optimizer's own selection in priority order (not a threshold replay, which
+  ties make inexact), hash-linked to the policy and the batch. This is the
+  hand-off to a human review workflow: it decides *what* is reviewed, still
+  not *how* (docs/interfaces.md §10).
 
 ### 4. Backtester (`backtest`)
 
@@ -144,24 +161,44 @@ the ground truth, every claim is mathematically verifiable. Three scenarios:
 3. **Drift**: error distribution shifts between calibration and deployment
    periods; the backtester exposes that the stale policy degraded.
 
+### 7. Policy comparison (`compare`, v1.x)
+
+Before switching policies: replay the current and the candidate policy on
+the same labeled history, each with its own hash-verified calibrator, and
+report captured loss, residual loss, review count and review spend for
+both, with the change overall and per segment, plus the review-queue change
+(items kept, dropped, added). Both policies are priced by ONE cost basis:
+their shared costs, or an explicitly supplied `--eval-costs` model.
+Incompatible costs without one are rejected, because the verdict can flip
+with the basis. A paired bootstrap puts a CI on every change; the opt-in
+`--fail-on-regression` gate (exit 6) fails only on a significant
+regression. `report --compare` renders it in the report's visual system.
+Pinned in docs/interfaces.md §14.
+
 ## CLI
 
 ```bash
 triage calibrate --golden golden.parquet [--seed N] [--max-ece F [--ece-gate-mode point|ci_upper]] \
                  -o calibrator.json
 triage plan --batch batch.parquet --calibrator calibrator.json \
-            --costs costs.yaml --budget 0.10 -o policy.json
+            --costs costs.yaml --budget 0.10 [--budget-strategy prefix|fill] -o policy.json \
+            [--queue-csv review_queue.csv] [--queue-parquet review_queue.parquet]
 triage backtest --policy policy.json --calibrator calibrator.json \
                 --history history.parquet -o backtest.json
 triage report --from artifacts/ -o report.html
 triage synth --scenario overconfident --seed 42 -o data/
 triage run --scenario overconfident --seed 42 -o runs/demo   # whole chain, see interfaces.md §8
+triage compare --current-policy a/policy.json --current-calibrator a/calibrator.json \
+               --candidate-policy b/policy.json --candidate-calibrator b/calibrator.json \
+               --history history.parquet [--eval-costs costs.yaml] -o comparison/
+triage report --compare comparison/ -o comparison.html
 ```
 
 Exit codes (public API, see CLAUDE.md): 0 OK, 1 contract violation,
 2 residual risk gate failed, 3 calibration gate failed, 4 internal error,
-5 budget overrun gate failed (`backtest --max-budget-overrun`).
-`plan` and `backtest` are designed to run inside CI as gates.
+5 budget overrun gate failed (`backtest --max-budget-overrun`),
+6 candidate significantly worse (`compare --fail-on-regression`).
+`plan`, `backtest` and `compare` are designed to run inside CI as gates.
 
 ## Phases
 
@@ -188,7 +225,9 @@ numbers match analytical expectations within tolerance; all tests green.
 - **Grouped routing**: when a reviewer opens a document, reviewing an extra
   field is nearly free → route documents whose value is the sum of their
   fields' expected losses. Greedy stops being optimal; becomes a knapsack
-  variant. Nice problem, explicitly out of MVP/v1 scope.
+  variant (item-level money budgets already are one, handled approximately
+  by the opt-in `fill` strategy). Nice problem, explicitly out of MVP/v1
+  scope.
 
 ## Non-goals
 

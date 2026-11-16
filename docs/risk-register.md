@@ -86,3 +86,102 @@ signing requires key infrastructure that is out of scope for a local-first
 tool.
 
 **Decision: accept.** Documented boundary; build nothing.
+
+### R5 — An exported review queue is actionable even when a gate failed (review-queue export, v1.x)
+
+The optional review-queue export (interfaces.md §10) is the first artifact
+designed to be consumed directly by people rather than by the next pipeline
+stage. Consistent with F3/R2 (artifact-first), `plan` writes the queue even
+when the ECE or residual gate fails, and still exits 2/3. Once the queue file
+is detached from the exit code, for example picked up by a scheduler that
+only looks at files, a failed-gate queue could be worked through by reviewers
+as if it were approved.
+
+**Decision: mitigate (v1.x), record rather than suppress (owner decision).**
+The queue's sidecar `review_queue.json` carries a `gates` record
+(`{"status": "pass"|"failed", "failed": [...]}`). The record is derived by
+evaluating both plan gates before anything is raised, so it lists every
+failed gate, not only the one that set the exit code. Tests pin
+`gates.status == "pass"` iff `plan` exits 0. Not suppressing the export keeps
+one rule for every artifact, and it keeps the queue inspectable for exactly
+the plan that failed. The residual risk is a consumer that ignores both the
+exit code and the manifest. That is documented prominently in the README,
+and nothing more can be enforced from inside the tool.
+
+Two smaller, accepted boundaries of the same export:
+
+- **Spreadsheet formula injection.** `item_id`/`segment` are opaque strings
+  written verbatim to CSV. A value beginning with `=`, `+`, `-` or `@` may be
+  evaluated if the file is opened in a spreadsheet. *Accept:* escaping would
+  break the exact, reconcilable round trip the export exists for, and the
+  engine never interprets these values. Sanitize at the spreadsheet
+  boundary. Documented in the README.
+- **`plan` does not clean up.** Re-exporting a different set of formats into
+  the same directory leaves the earlier file of the other format in place.
+  *Accept:* `plan` never deletes files (only `run` owns an output layout).
+  The manifest's `files` list and per-row `policy_hash` identify which files
+  belong to which plan.
+
+### R6 — Opt-in `fill` money strategy optimizes net benefit, not captured loss
+
+Origin: design of the opt-in `fill` strategy (v1.x), not the review above.
+
+The default money allocation (`prefix`) stops at the first item that does
+not fit, which can leave budget that cheaper, positive-net-benefit items
+would use. The opt-in `budget.strategy: fill` (interfaces.md §5) skips
+non-fitting items and keeps the better of two greedy candidates by total
+expected net benefit. It is never worse than `prefix` on that objective,
+at least half of the optimum, and keeps per-segment threshold replay exact.
+It carries three residual risks:
+
+1. **Residual-risk gate is not monotone.** Maximizing net benefit (captured
+   expected loss minus review spend) can select an allocation that captures
+   less expected loss than `prefix`. A plan that passed
+   `gates.max_residual_risk` can then fail it (exit 2).
+2. **Less slack for ties.** `fill` spends nearly the whole budget, so
+   threshold-tie inflation at replay (R1) reaches
+   `--max-budget-overrun` sooner.
+3. **Expected, not realized.** The gain is in the calibrated expectation.
+   Measured on the overconfident scenario (seed 42, widened review costs
+   45/3/1, money budget 1,000): expected captured loss 3,527 → 7,587,
+   realized captured loss only 7,000 → 7,220.
+
+**Decision: accept (v1.x), opt-in.** `prefix` stays the default and its
+outputs are byte-identical (`strategy` is omitted from snapshots at its
+default, as with `ece_gate_mode` in R3). The gates above still apply to
+`fill` policies unchanged, and the backtest measures the realized effect.
+Exact knapsack optimization was rejected (float costs, no cheap bit-for-bit
+reproducible exact method). `fill` does not address R1: budgets are still
+not enforced exactly at replay.
+
+
+### R7 — A policy comparison on one history can mistake noise for a verdict
+
+`compare` (interfaces.md §14) replays two policies on one labeled history.
+A small difference is a point estimate on one sample: on the
+overconfident scenario at seed 42, a candidate calibrated with seed 43
+instead of 42 reviews 3 fewer items (of ~1,180) for the same loss. By
+dominance that is an "improvement", and a naive CI gate would bless it, or,
+the other way round, fail a release on a difference of that size.
+
+A second, related risk is **incomparable units**. Two policies planned
+under different cost models report losses in different units. On the same
+scenario, a `seg_mid` cost change turns "candidate significantly worse" (by
+the current costs) into "candidate slightly better" (by its own costs).
+
+**Decision: mitigate (v1.x).**
+- Units: `compare` refuses to compare policies whose costs disagree on any
+  history segment (exit 1, listing the segments). Instead, it takes one
+  explicit `--eval-costs` basis, records it in `comparison.json`, and shows
+  it on the page.
+- Noise: a paired bootstrap over history items puts a CI on every change
+  and yields a CI verdict (with `inconclusive`). The seed-43 example reads
+  `inconclusive`. The opt-in `--fail-on-regression` gate (exit 6) reads
+  ONLY the CI verdict: it fails when total cost is significantly higher, or
+  on a significant regression.
+
+Residual: the bootstrap treats history items as exchangeable. It does not
+model drift between the history and the future (that is what `backtest`
+and the `drift` scenario expose), nor correlation between items (e.g. many
+fields of one document). A comparison on a stale history is precise about
+the wrong period.

@@ -117,3 +117,26 @@ def kpi_block(html: str, name: str) -> str:
 
 def first_figure_index(html: str) -> int:
     return html.index('class="plotly-graph-div"')
+
+
+_TABLE_RE = re.compile(r"<table\b[^>]*>(.*?)</table>", re.S | re.I)
+_ROW_RE = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.S | re.I)
+_CELL_RE = re.compile(r"<t([hd])\b([^>]*)>", re.I)
+_COLSPAN_RE = re.compile(r'colspan="(\d+)"', re.I)
+
+
+def table_shapes(html: str) -> list[list[int]]:
+    """Per <table>, the number of columns each row spans (colspans counted).
+    A well-formed table has one distinct value per table: a row with an extra
+    or a missing cell shifts every value under the wrong heading."""
+    shapes = []
+    for table in _TABLE_RE.findall(strip_scripts(html)):
+        widths = []
+        for row in _ROW_RE.findall(table):
+            width = 0
+            for _kind, attrs in _CELL_RE.findall(row):
+                span = _COLSPAN_RE.search(attrs)
+                width += int(span.group(1)) if span else 1
+            widths.append(width)
+        shapes.append(widths)
+    return shapes

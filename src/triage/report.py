@@ -23,29 +23,32 @@ from typing import Any, Literal
 
 import plotly.graph_objects as go
 import plotly.offline
-from jinja2 import Environment, PackageLoader, select_autoescape
 
 from triage.artifacts import content_hash
 from triage.exceptions import ContractViolation
+from triage.render_utils import (
+    COLOR_POLICY,
+    COLOR_RANDOM,
+    COLOR_RAW,
+    GRID_COLOR,
+    INK,
+    NEUTRAL,
+    base_layout,
+    budget_label,
+    environment,
+    fmt_cost,
+    fmt_count,
+    fmt_ece,
+    fmt_lift,
+    fmt_pct,
+    fmt_ratio,
+    segment_cost,
+    to_html,
+)
 
-__all__ = ["render"]
-
-# Palette (interfaces.md §11.11.1). Status colours (ok/attention/failed) are
-# reserved for verdicts, so no data series below uses green, amber or red.
-_COLOR_POLICY = "#2a78d6"
-_COLOR_RAW = "#7c5cc4"
-_COLOR_RANDOM = "#9aa1a9"
-_STATUS_COLOR = {"ok": "#15803d", "attention": "#d97706", "failed": "#dc2626"}
-_NEUTRAL = "#64748b"
-_INK = "#1f2933"
-_GRID_COLOR = "#e7eaee"
-_BG_COLOR = "#fcfcfb"
-
-_FONT = {
-    "family": "-apple-system, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif",
-    "size": 12,
-    "color": _INK,
-}
+# The fmt_* filters moved to render_utils (shared with the comparison page);
+# they stay importable from here, where tests and callers have always found them.
+__all__ = ["render", "fmt_cost", "fmt_count", "fmt_ece", "fmt_lift", "fmt_pct", "fmt_ratio"]
 
 _TEMPLATE_NAME = "report.html.j2"
 
@@ -125,69 +128,6 @@ def _verify_chain(
     return calibrator_hash
 
 
-# ---------------------------------------------------------------------------
-# Number formatting (§11.11.3) -- locale-free, pure; registered as Jinja
-# filters AND used directly when building Check/Summary text below, so a
-# number reads the same in a sentence as it does in a table cell.
-# ---------------------------------------------------------------------------
-
-
-def fmt_count(value: float | int | None) -> str:
-    return "\u2014" if value is None else f"{int(round(value)):,d}"
-
-
-def fmt_cost(value: float | None) -> str:
-    return "\u2014" if value is None else f"{value:,.0f}"
-
-
-def fmt_pct(value: float | None, decimals: int = 1) -> str:
-    return "\u2014" if value is None else f"{value * 100:.{decimals}f}%"
-
-
-def fmt_ratio(value: float | None) -> str:
-    return "\u2014" if value is None else f"{value:.2f}\u00d7"
-
-
-def fmt_lift(value: float | None) -> str:
-    if value is None:
-        return "\u2014"
-    return f"{value:.1f}\u00d7" if value < 10 else f"{value:.0f}\u00d7"
-
-
-def fmt_ece(value: float | None) -> str:
-    return "\u2014" if value is None else f"{value:.3f}"
-
-
-def _base_layout(**overrides: Any) -> dict[str, Any]:
-    """No fixed width (§11.11): figures fill their container; only height is
-    pinned. `to_html`'s `config={"responsive": True}` (set by callers) makes
-    plotly resize the div on the client without changing the serialized
-    figure spec, so output stays byte-identical for identical inputs."""
-    layout: dict[str, Any] = {
-        "autosize": True,
-        "plot_bgcolor": _BG_COLOR,
-        "paper_bgcolor": _BG_COLOR,
-        "font": dict(_FONT),
-        "margin": {"l": 60, "r": 110, "t": 40, "b": 50},
-        "showlegend": False,
-    }
-    layout.update(overrides)
-    return layout
-
-
-_PLOTLY_CONFIG = {"responsive": True, "displaylogo": False}
-
-
-def _to_html(fig: go.Figure, *, div_id: str, include_plotlyjs: bool) -> str:
-    html: str = fig.to_html(
-        full_html=False,
-        include_plotlyjs=include_plotlyjs,
-        div_id=div_id,
-        config=_PLOTLY_CONFIG,
-    )
-    return html
-
-
 def _reliability_figure(calibrator_dict: dict[str, Any], *, div_id: str) -> str:
     """Before/after reliability; marker AREA (not radius) proportional to the
     bin's item count, so a 5-item bin does not visually outweigh a 500-item
@@ -207,7 +147,7 @@ def _reliability_figure(calibrator_dict: dict[str, Any], *, div_id: str) -> str:
             y=[0, 1],
             mode="lines",
             name="perfect calibration",
-            line={"color": _NEUTRAL, "width": 1, "dash": "dot"},
+            line={"color": NEUTRAL, "width": 1, "dash": "dot"},
             hoverinfo="skip",
         )
     )
@@ -217,8 +157,8 @@ def _reliability_figure(calibrator_dict: dict[str, Any], *, div_id: str) -> str:
             y=[b["mean_observed"] for b in before],
             mode="lines+markers",
             name="raw score",
-            line={"color": _COLOR_RAW, "width": 1.5},
-            marker={"color": _COLOR_RAW, "size": sizes(before)},
+            line={"color": COLOR_RAW, "width": 1.5},
+            marker={"color": COLOR_RAW, "size": sizes(before)},
             customdata=[b["count"] for b in before],
             hovertemplate="predicted %{x:.2f} / observed %{y:.2f} / n=%{customdata}<extra></extra>",
         )
@@ -229,25 +169,25 @@ def _reliability_figure(calibrator_dict: dict[str, Any], *, div_id: str) -> str:
             y=[b["mean_observed"] for b in after],
             mode="lines+markers",
             name="calibrated",
-            line={"color": _COLOR_POLICY, "width": 1.5},
-            marker={"color": _COLOR_POLICY, "size": sizes(after)},
+            line={"color": COLOR_POLICY, "width": 1.5},
+            marker={"color": COLOR_POLICY, "size": sizes(after)},
             customdata=[b["count"] for b in after],
             hovertemplate="predicted %{x:.2f} / observed %{y:.2f} / n=%{customdata}<extra></extra>",
         )
     )
     fig.update_layout(
-        **_base_layout(
+        **base_layout(
             xaxis={
                 "title": {"text": "mean predicted error rate"},
                 "range": [0, 1],
                 "showgrid": True,
-                "gridcolor": _GRID_COLOR,
+                "gridcolor": GRID_COLOR,
             },
             yaxis={
                 "title": {"text": "mean observed error rate"},
                 "range": [0, 1],
                 "showgrid": True,
-                "gridcolor": _GRID_COLOR,
+                "gridcolor": GRID_COLOR,
             },
             showlegend=True,
             legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
@@ -255,7 +195,7 @@ def _reliability_figure(calibrator_dict: dict[str, Any], *, div_id: str) -> str:
             height=300,
         )
     )
-    return _to_html(fig, div_id=div_id, include_plotlyjs=False)
+    return to_html(fig, div_id=div_id)
 
 
 def _capture_figure(backtest_dict: dict[str, Any], *, div_id: str) -> str:
@@ -270,9 +210,9 @@ def _capture_figure(backtest_dict: dict[str, Any], *, div_id: str) -> str:
     random_std_rate = (strategies["random"]["captured_loss_std"] / total) if total else 0.0
 
     rows = [
-        ("Random review", random_rate, _COLOR_RANDOM, random_std_rate, policy_rate, raw_rate),
-        ("Raw model confidence", raw_rate, _COLOR_RAW, 0.0, policy_rate, raw_rate),
-        ("Triage policy", policy_rate, _COLOR_POLICY, 0.0, None, None),
+        ("Random review", random_rate, COLOR_RANDOM, random_std_rate, policy_rate, raw_rate),
+        ("Raw model confidence", raw_rate, COLOR_RAW, 0.0, policy_rate, raw_rate),
+        ("Triage policy", policy_rate, COLOR_POLICY, 0.0, None, None),
     ]
     labels = [r[0] for r in rows]
     values = [0.0 if r[1] is None else r[1] * 100.0 for r in rows]
@@ -296,19 +236,19 @@ def _capture_figure(backtest_dict: dict[str, Any], *, div_id: str) -> str:
             y=labels,
             orientation="h",
             marker_color=colors,
-            error_x={"type": "data", "array": errors, "visible": True, "color": _INK},
+            error_x={"type": "data", "array": errors, "visible": True, "color": INK},
             text=text,
             textposition="outside",
             hovertemplate="%{y}: %{x:.1f}%<extra></extra>",
         )
     )
     fig.update_layout(
-        **_base_layout(
+        **base_layout(
             xaxis={
                 "title": {"text": "share of loss caught"},
                 "range": [0, 100],
                 "showgrid": True,
-                "gridcolor": _GRID_COLOR,
+                "gridcolor": GRID_COLOR,
                 "ticksuffix": "%",
             },
             yaxis={"automargin": True},
@@ -316,16 +256,16 @@ def _capture_figure(backtest_dict: dict[str, Any], *, div_id: str) -> str:
             margin={"l": 140, "r": 60, "t": 10, "b": 40},
         )
     )
-    return _to_html(fig, div_id=div_id, include_plotlyjs=False)
+    return to_html(fig, div_id=div_id)
 
 
 def _coverage_figure(backtest_dict: dict[str, Any], *, budget_fraction: float, div_id: str) -> str:
     curves = backtest_dict["curves"]
     grid_pct = [g * 100.0 for g in curves["grid"]]
     series = [
-        ("random", "Random", _COLOR_RANDOM, "dot"),
-        ("raw_confidence", "Raw confidence", _COLOR_RAW, "dash"),
-        ("policy", "Triage policy", _COLOR_POLICY, "solid"),
+        ("random", "Random", COLOR_RANDOM, "dot"),
+        ("raw_confidence", "Raw confidence", COLOR_RAW, "dash"),
+        ("policy", "Triage policy", COLOR_POLICY, "solid"),
     ]
 
     fig = go.Figure()
@@ -351,7 +291,7 @@ def _coverage_figure(backtest_dict: dict[str, Any], *, budget_fraction: float, d
         fig.add_vline(
             x=budget_fraction * 100.0,
             line_width=1,
-            line_color=_INK,
+            line_color=INK,
             line_dash="dot",
             annotation_text=f"your budget ({fmt_pct(budget_fraction, 0)})",
             annotation_position="top",
@@ -369,18 +309,18 @@ def _coverage_figure(backtest_dict: dict[str, Any], *, budget_fraction: float, d
             )
 
     fig.update_layout(
-        **_base_layout(
+        **base_layout(
             xaxis={
                 "title": {"text": "share of items reviewed"},
                 "showgrid": True,
-                "gridcolor": _GRID_COLOR,
+                "gridcolor": GRID_COLOR,
                 "ticksuffix": "%",
             },
             yaxis={
                 "title": {"text": "share of loss caught"},
                 "range": [0, 105],
                 "showgrid": True,
-                "gridcolor": _GRID_COLOR,
+                "gridcolor": GRID_COLOR,
                 "ticksuffix": "%",
             },
             showlegend=True,
@@ -389,7 +329,7 @@ def _coverage_figure(backtest_dict: dict[str, Any], *, budget_fraction: float, d
             height=320,
         )
     )
-    return _to_html(fig, div_id=div_id, include_plotlyjs=False)
+    return to_html(fig, div_id=div_id)
 
 
 def _segments_figure(
@@ -415,7 +355,7 @@ def _segments_figure(
             y=names,
             orientation="h",
             name="plan expected",
-            marker={"color": "rgba(0,0,0,0)", "line": {"color": _INK, "width": 1.5}},
+            marker={"color": "rgba(0,0,0,0)", "line": {"color": INK, "width": 1.5}},
             hovertemplate="%{y} (plan): %{x:,.0f}<extra></extra>",
         )
     )
@@ -425,17 +365,17 @@ def _segments_figure(
             y=names,
             orientation="h",
             name="actual",
-            marker={"color": _COLOR_POLICY},
+            marker={"color": COLOR_POLICY},
             hovertemplate="%{y} (actual): %{x:,.0f}<extra></extra>",
         )
     )
     fig.update_layout(
-        **_base_layout(
+        **base_layout(
             barmode="group",
             xaxis={
                 "title": {"text": "unreviewed risk (cost units)"},
                 "showgrid": True,
-                "gridcolor": _GRID_COLOR,
+                "gridcolor": GRID_COLOR,
             },
             yaxis={"automargin": True, "autorange": "reversed"},
             showlegend=True,
@@ -444,7 +384,7 @@ def _segments_figure(
             height=80 + 46 * max(len(names), 1),
         )
     )
-    return _to_html(fig, div_id=div_id, include_plotlyjs=False)
+    return to_html(fig, div_id=div_id)
 
 
 def _gate_verdict(threshold: float | None, value: float | None) -> Severity:
@@ -466,10 +406,9 @@ def _gate_row(
     checked: str,
     verdict_override: str | None = None,
 ) -> dict[str, Any]:
-    """Build one verdict-bearing gates row: FAIL iff value > threshold (strict,
-    matching calibration.check_ece_gate), "not set" if threshold is null/absent.
-    `kind` ("ece" or "loss") selects the template's number format; `checked`
-    names the exact artifact field whose value is compared to the threshold."""
+    """One gates-table row with the `_gate_verdict` verdict (FAIL / PASS /
+    "not set"). `kind` ("ece" or "loss") selects the number format; `checked`
+    names the artifact field compared to the threshold."""
     verdict = (
         verdict_override
         or {"fail": "FAIL", "pass": "PASS", "info": "not set"}[_gate_verdict(threshold, value)]
@@ -633,18 +572,6 @@ def _worst_segment(
     # it sees -> smallest name among ties, matching the name-ASC tie-break.
     best = max(names, key=lambda n: realized(n) - expected(n))
     return best, expected(best), realized(best)
-
-
-def _budget_label(policy_dict: dict[str, Any]) -> str:
-    budget = policy_dict.get("budget", {}) or {}
-    kind, value = budget.get("type"), budget.get("value")
-    if kind == "fraction" and value is not None:
-        return f"budget {fmt_pct(value, 0)}"
-    if kind == "count" and value is not None:
-        return f"budget {fmt_count(value)} items"
-    if kind == "money" and value is not None:
-        return f"budget {fmt_cost(value)} cost units"
-    return "budget not set"
 
 
 def _gate_checks(
@@ -957,7 +884,7 @@ def _build_kpis(
     so a KPI tile can never disagree with the check that explains it."""
     totals = policy_dict.get("totals", {}) or {}
     planned_n, n_total = totals.get("n_review"), totals.get("n_total")
-    budget_label = _budget_label(policy_dict)
+    budget_text = budget_label(policy_dict)
 
     if backtest_dict is None:
         expected_captured = totals.get("expected_captured_loss")
@@ -968,7 +895,7 @@ def _build_kpis(
                 "value": planned_n,
                 "total": n_total,
                 "share": (planned_n / n_total) if n_total else None,
-                "budget_label": budget_label,
+                "budget_label": budget_text,
                 "over_plan": None,
             },
             "capture": {
@@ -1011,7 +938,7 @@ def _build_kpis(
             "value": replayed_n,
             "total": n_total,
             "share": (replayed_n / n_total) if n_total else None,
-            "budget_label": budget_label,
+            "budget_label": budget_text,
             "over_plan": (
                 (replayed_n - (planned_n or 0)) if replayed_n > (planned_n or 0) else None
             ),
@@ -1036,15 +963,6 @@ def _build_kpis(
     }
 
 
-def _segment_cost(config_snapshot: dict[str, Any], name: str) -> dict[str, Any] | None:
-    """Mirrors `CostModel.costs_for` (§3) for display: exact key, else
-    'default', else None (rendered as "—", never a crash -- if an artifact
-    reached `render` its costs already resolved successfully at plan/backtest
-    time; this is a display-only best-effort lookup)."""
-    segments = config_snapshot.get("segments", {}) or {}
-    return segments.get(name) or segments.get("default")
-
-
 def _build_segments_view(
     policy_dict: dict[str, Any], backtest_dict: dict[str, Any] | None
 ) -> dict[str, Any]:
@@ -1062,7 +980,7 @@ def _build_segments_view(
     for name in names:
         ps = policy_segments.get(name, {})
         rs = realized_segments.get(name, {})
-        cost = _segment_cost(config_snapshot, name)
+        cost = segment_cost(config_snapshot, name)
         expected_residual = ps.get("expected_residual_loss")
         realized_residual = rs.get("residual_loss") if backtest_dict is not None else None
         ratio = (
@@ -1188,20 +1106,7 @@ def render(
     segments_view = _build_segments_view(policy_dict, backtest_dict)
     gates_view = _build_gates_view(calibrator_dict, policy_dict, backtest_dict)
 
-    env = Environment(
-        loader=PackageLoader("triage"),
-        autoescape=select_autoescape(default=True, default_for_string=True),
-        keep_trailing_newline=True,
-    )
-    for name, fn in (
-        ("fmt_count", fmt_count),
-        ("fmt_cost", fmt_cost),
-        ("fmt_pct", fmt_pct),
-        ("fmt_ratio", fmt_ratio),
-        ("fmt_lift", fmt_lift),
-        ("fmt_ece", fmt_ece),
-    ):
-        env.filters[name] = fn
+    env = environment()
     template = env.get_template(_TEMPLATE_NAME)
     rendered: str = template.render(
         tool_version=tool_version,

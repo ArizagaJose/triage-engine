@@ -1,157 +1,9 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>triage report</title>
-<style>
-  :root {
-    --ink: #1f2933;
-    --muted: #6b7785;
-    --policy: #2a78d6;
-    --raw: #7c5cc4;
-    --random: #9aa1a9;
-    --bg: #fcfcfb;
-    --grid: #e7eaee;
-    --border: #e3e6ea;
-    --ok: #15803d;
-    --ok-tint: #ecfdf3;
-    --ok-border: #86d5a4;
-    --attention: #d97706;
-    --attention-tint: #fff8e6;
-    --attention-border: #f5c26b;
-    --failed: #dc2626;
-    --failed-tint: #fef2f2;
-    --failed-border: #f3a5a5;
-    --neutral: #64748b;
-    --neutral-tint: #f1f5f9;
-    --neutral-border: #cbd5e1;
-  }
-  * { box-sizing: border-box; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    color: var(--ink);
-    background: #f3f4f6;
-    margin: 0;
-    padding: 0 0 3rem 0;
-    line-height: 1.55;
-    font-size: 15px;
-  }
-  main {
-    max-width: 880px;
-    margin: 1.75rem auto;
-    background: #fff;
-    border: 1px solid var(--border);
-    padding: 2.75rem 3.5rem 2.5rem;
-  }
-  header.page-head {
-    border-bottom: 1px solid #eceef1;
-    padding-bottom: 0.75rem;
-    margin-bottom: 1.6rem;
-    font-size: 0.8rem;
-    color: var(--muted);
-  }
-  header.page-head .brand { letter-spacing: 0.1em; text-transform: uppercase; font-weight: bold; color: var(--ink); }
-  header.page-head .right { float: right; text-align: right; }
-  header.page-head .chain-ok { color: var(--ok); font-weight: bold; }
-  h1 { font-size: 1.7rem; line-height: 1.25; margin: 0.7rem 0 0.6rem; letter-spacing: -0.01em; }
-  h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);
-       margin: 2.4rem 0 0.9rem; padding-bottom: 0.5rem; border-bottom: 1px solid #eceef1; }
-  h3 { font-size: 1.02rem; margin-top: 1.4rem; }
-  p.lede { font-size: 1.05rem; color: #3b4652; margin: 0 0 1.7rem; max-width: 680px; }
-  .meta { color: var(--muted); font-size: 0.85rem; margin: 0.1rem 0; }
-  .status-badge {
-    display: inline-block; font-size: 0.75rem; font-weight: bold; letter-spacing: 0.05em;
-    text-transform: uppercase; padding: 0.2rem 0.65rem 0.2rem 0.5rem; border-radius: 999px;
-  }
-  .status-badge .dot { display: inline-block; width: 0.5rem; height: 0.5rem; border-radius: 50%;
-                        margin-right: 0.35rem; vertical-align: 1px; }
-  .status-ok { background: var(--ok-tint); color: var(--ok); }
-  .status-attention { background: var(--attention-tint); color: var(--attention); }
-  .status-failed { background: var(--failed-tint); color: var(--failed); }
-  .status-neutral { background: var(--neutral-tint); color: var(--neutral); }
-  .kpis { display: table; width: 100%; table-layout: fixed; border-top: 1px solid #eceef1;
-          border-bottom: 1px solid #eceef1; margin: 0 0 1.8rem; }
-  .kpi { display: table-cell; padding: 1rem 1rem 1rem 1.1rem; border-left: 1px solid #eceef1; vertical-align: top; }
-  .kpi:first-child { border-left: none; padding-left: 0; }
-  .kpi .label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: bold; }
-  .kpi .big { font-size: 1.8rem; font-weight: bold; line-height: 1.2; margin: 0.25rem 0 0.15rem; letter-spacing: -0.01em; }
-  .kpi .sub { font-size: 0.78rem; color: var(--muted); line-height: 1.4; }
-  .kpi .big.c-fail { color: var(--failed); }
-  .kpi .big.c-warn { color: var(--attention); }
-  .kpi .big.c-policy { color: var(--policy); }
-  .checks { margin-top: 0.4rem; }
-  details.check {
-    border: 1px solid var(--border); border-top: none; padding: 0;
-  }
-  details.check:first-of-type { border-top: 1px solid var(--border); border-radius: 7px 7px 0 0; }
-  details.check:last-of-type { border-radius: 0 0 7px 7px; }
-  details.check summary {
-    list-style: none; cursor: pointer; padding: 0.7rem 1rem 0.7rem 3.1rem; position: relative;
-  }
-  details.check summary::-webkit-details-marker { display: none; }
-  details.check:not([open]) .dbody { display: none; }
-  details.check .dbody { padding: 0 1rem 1.1rem 3.1rem; font-size: 0.88rem; color: #4a5562; }
-  details.check.warn { border-left: 3px solid var(--attention); background: #fffdf7; }
-  details.check.fail { border-left: 3px solid var(--failed); background: #fffafa; }
-  .sev-icon {
-    position: absolute; left: 1rem; top: 0.75rem; display: inline-block; width: 1.3rem; height: 1.3rem;
-    line-height: 1.3rem; border-radius: 50%; color: #fff; text-align: center; font-weight: bold;
-    font-size: 0.8rem; font-family: Arial, "DejaVu Sans", sans-serif;
-  }
-  .sev-icon.fail { background: var(--failed); }
-  .sev-icon.warn { background: var(--attention); }
-  .sev-icon.info { background: var(--neutral); }
-  .sev-icon.pass { background: var(--ok); }
-  .check .val { float: right; font-size: 0.85rem; color: var(--muted); margin-top: 0.05rem; }
-  .check .evidence-link { float: right; font-size: 0.78rem; margin-left: 0.8rem; color: var(--policy); text-decoration: none; }
-  .check .t { font-weight: bold; }
-  .figure-wrap { margin: 0.9rem 0 1.1rem; }
-  table.tbl { border-collapse: collapse; width: 100%; margin: 0.6rem 0 1.1rem; font-size: 0.88rem; }
-  table.tbl th, table.tbl td {
-    border-bottom: 1px solid #eef0f2; padding: 0.45rem 0.6rem; text-align: right;
-  }
-  table.tbl th { text-align: right; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em;
-                 color: var(--muted); font-weight: bold; vertical-align: bottom; line-height: 1.3;
-                 border-bottom: 1.5px solid #d9dde2; }
-  table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
-  table.tbl tr.totals td { border-top: 1.5px solid #d9dde2; font-weight: bold; }
-  .muted { color: var(--muted); }
-  .warn-text { color: var(--attention); }
-  .fail-text { color: var(--failed); }
-  .badge { display: inline-block; font-size: 0.7rem; font-weight: bold; padding: 0.1rem 0.5rem; border-radius: 4px; letter-spacing: 0.03em; }
-  .b-pass { background: var(--ok-tint); color: var(--ok); }
-  .b-fail { background: var(--failed-tint); color: var(--failed); }
-  .b-none { background: var(--neutral-tint); color: var(--neutral); }
-  code.hash { font-family: "SFMono-Regular", Consolas, Menlo, monospace; font-size: 0.78rem; word-break: break-all; background: #f3f4f6; padding: 0.05rem 0.3rem; border-radius: 3px; }
-  .note {
-    background: #f7f8fa; border-left: 3px solid var(--neutral-border); padding: 0.75rem 1rem;
-    border-radius: 4px; font-size: 0.92rem; color: #4a5562;
-  }
-  details.audit { border: 1px solid var(--border); border-radius: 7px; }
-  details.audit summary { padding: 0.75rem 1rem; cursor: pointer; list-style: none; font-size: 0.88rem; }
-  details.audit summary::-webkit-details-marker { display: none; }
-  details.audit:not([open]) .dbody { display: none; }
-  details.audit .dbody { padding: 0 1rem 0.75rem; }
-  .arrow { color: var(--muted); margin: 0 0.4rem; }
-  footer.page-foot { margin-top: 2rem; font-size: 0.78rem; color: #8a949e; border-top: 1px solid #eceef1; padding-top: 0.75rem; }
-</style>
-</head>
-<body>
-<main data-status="{{ summary.status }}" data-mode="{{ summary.mode }}">
-
-<header class="page-head">
-  <span class="brand">triage</span> &nbsp;review routing report
-  <span class="right">
-    tool_version: {{ tool_version }}<br>
-    <span class="chain-ok">&#10003; artifact chain verified</span>
-  </span>
-  <p id="created-at" class="meta">{{ created_at }}</p>
-</header>
-
+{% extends "_base.html.j2" %}
+{% import "_macros.html.j2" as m %}
+{% block main_attrs %}data-status="{{ summary.status }}" data-mode="{{ summary.mode }}"{% endblock %}
+{% block content %}
 <section id="at-a-glance">
-  <span class="status-badge status-{{ status_color }}">
-    <span class="dot"></span>{{ status_label }}
-  </span>
+  {{ m.status_badge(status_color, status_label) }}
   {% if summary.status != "ok" %}
   <h1>{{ summary.checks[0].title }}</h1>
   {% elif summary.mode == "full" %}
@@ -224,20 +76,7 @@
     </div>
   </div>
 
-  <div class="checks">
-    {% for c in summary.checks %}
-    <details class="check {{ c.severity }}" data-check-id="{{ c.id }}" data-severity="{{ c.severity }}"
-              {% if c.severity in ("fail", "warn") %}open{% endif %}>
-      <summary>
-        <span class="sev-icon {{ c.severity }}">{{ severity_icon[c.severity] }}</span>
-        <span class="val">{{ c.value }}</span>
-        <a class="evidence-link" href="#{{ c.section }}">evidence &#9656;</a>
-        <div class="t">{{ c.title }}</div>
-      </summary>
-      <div class="dbody">{{ c.detail }}</div>
-    </details>
-    {% endfor %}
-  </div>
+  {{ m.checks_list(summary.checks, severity_icon) }}
 </section>
 
 <script type="text/javascript">{{ plotly_bundle|safe }}</script>
@@ -304,7 +143,6 @@
     {% for row in segments.rows %}
     <tr>
       <td>{{ row.name }}</td>
-      <td>{{ row.checked }}</td>
       <td>{{ row.false_accept_cost|fmt_cost }} / {{ row.review_cost|fmt_cost }}</td>
       <td>{% if row.threshold is none %}&mdash;{% else %}{{ "%.3f"|format(row.threshold) }}{% endif %}</td>
       <td>{{ row.n_review_planned|fmt_count }}{% if row.n_review_replayed is not none and row.n_review_replayed != row.n_review_planned %} &rarr; {{ row.n_review_replayed|fmt_count }}{% endif %} <span class="muted">of {{ row.n_total|fmt_count }}</span></td>
@@ -375,25 +213,5 @@
   </table>
 </section>
 
-<section id="audit">
-  <h2>Audit trail</h2>
-  <details class="audit">
-    <summary>
-      &#9656; {% for label, h in short_chain %}{{ label }} <code class="hash">{{ h[:10] }}</code>{% if not loop.last %}<span class="arrow">&rarr;</span>{% endif %}{% endfor %}
-    </summary>
-    <div class="dbody">
-      <table class="tbl">
-        {% for label, value in hash_rows %}
-        <tr><td>{{ label }}</td><td><code class="hash">{{ value }}</code></td></tr>
-        {% endfor %}
-      </table>
-    </div>
-  </details>
-</section>
-
-<footer class="page-foot">Cost figures are in the units declared in costs.yaml. Generated by triage
-  {{ tool_version }} &middot; deterministic for identical artifacts.</footer>
-
-</main>
-</body>
-</html>
+{{ m.audit_section(short_chain, hash_rows) }}
+{% endblock %}

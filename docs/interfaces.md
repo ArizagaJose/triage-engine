@@ -24,6 +24,13 @@ class ResidualRiskExceeded(TriageError):
 
 class CalibrationGateFailed(TriageError):
     """ECE above the declared maximum. CLI exit code 3."""
+
+class BudgetOverrunExceeded(TriageError):
+    """Replayed review capacity above --max-budget-overrun. CLI exit code 5."""
+
+class CandidateRegression(TriageError):
+    """compare --fail-on-regression: candidate significantly worse (§14.9).
+    CLI exit code 6."""
 ```
 
 Any other exception → exit code 4 (internal error). Only `cli.py` calls
@@ -79,6 +86,7 @@ Pydantic v2 models, strict (`model_config = ConfigDict(extra="forbid")`):
 class Budget(BaseModel):
     type: Literal["fraction", "count", "money"]
     value: float                      # finite, > 0; if fraction: <= 1.0
+    strategy: Literal["prefix", "fill"] = "prefix"   # money allocation, see §5
 
 class Gates(BaseModel):
     max_residual_risk: float | None = None   # >= 0 (NaN rejected; inf = never fails)
@@ -127,6 +135,18 @@ overrides.
   Every existing `policy_hash` and the committed golden fixtures are
   unchanged. An absent key reads back as `"point"`. A non-default mode is
   always present in the snapshot.
+
+`Budget.strategy` pinned rules (v1.x, opt-in; allocation semantics in §5.5):
+
+- `"prefix"` (default) is the original allocation. `"fill"` is allowed only
+  with `type: money`; any other combination is a validation error (exit 1).
+  With fraction or count budgets every review consumes one unit, so there is
+  nothing to skip past and `fill` would silently change nothing.
+- **Serialization**: same rule as `ece_gate_mode`. `Budget.model_dump()`
+  OMITS `strategy` when it is `"prefix"`, so default-strategy snapshots and
+  every existing `policy_hash` are unchanged. An absent key reads back as
+  `"prefix"`. Older tool versions reject a snapshot that carries
+  `strategy` (`extra="forbid"`), which fails closed with exit 1.
 
 ## 4. Calibration (`src/triage/calibration.py`)
 
@@ -226,7 +246,20 @@ class Policy:
 
 def plan(batch: pl.DataFrame, calibrator: PredictsErrors, cost_model: CostModel,
          *, input_sha256s: dict[str, str], tool_version: str) -> Policy
+
+@dataclass(frozen=True)
+class PlanResult:          # v1.x, review queue export (§10)
+    policy: Policy
+    review_queue: pl.DataFrame   # REVIEW_QUEUE_SCHEMA, see §10.2
+
+def plan_with_queue(batch, calibrator, cost_model, *, input_sha256s,
+                    tool_version) -> PlanResult   # same parameters as plan()
 ```
+
+`plan_with_queue` performs the allocation below ONCE and returns both views of
+it. `plan()` is a thin wrapper returning `plan_with_queue(...).policy`, so the
+`Policy` (and `policy_hash`) is identical whether or not a caller asks for the
+queue. `Policy`, its `to_dict()` and policy.json are unchanged by v1.x.
 
 `PredictsErrors` is a small structural Protocol defined in `optimizer.py`
 (`def predict(self, scores: np.ndarray) -> np.ndarray`); the real `Calibrator`
@@ -242,12 +275,14 @@ Pinned semantics (do not improvise):
 5. Budget in review units:
    - `fraction` → `floor(value * n_batch)` items;
    - `count` → `int(value)` items (capped at `n_batch`);
-   - `money` → walk the sorted list, admit while cumulative
-     `review_cost <= value`; stop at the FIRST item that does not fit (no
-     skip-and-continue — keeping the review set a prefix of the ranking is
-     what makes per-segment thresholds exact).
+   - `money`, `strategy: prefix` (default) → walk the sorted list, admit
+     while cumulative `review_cost <= value`; stop at the FIRST item that
+     does not fit (no skip-and-continue).
+   - `money`, `strategy: fill` (opt-in) → see "Money budgets: the `fill`
+     strategy" below.
 6. Route to review while budget remains **and** `net_benefit > 0` (items with
    non-positive net benefit are never routed, even under unspent budget).
+   This holds for both money strategies.
 7. Per-segment `p_error_threshold` = min `p_error` among routed items of that
    segment; segments with zero routed items get threshold `null` (= review
    nothing). Applying a policy later means: review iff
@@ -261,8 +296,88 @@ Pinned semantics (do not improvise):
    `check_residual_gate(policy, cost_model) -> None` raising
    `ResidualRiskExceeded` (the CLI writes `policy.json` FIRST, then checks the
    gate — the artifact must exist for inspection even when the gate fails).
+10. **Review queue** (v1.x, `plan_with_queue` only): the routed items, in the
+    order of point 4, one row each (§10.2). It is built from the SAME
+    `routed` set and ranking the numbers in points 7–8 come from — never
+    re-derived from the thresholds, which ties make inexact (§9.4, §10.1).
+    The default allocation selects a prefix; money `fill` can skip items.
+    In both cases `review_priority` enumerates the selected subset in
+    ranking order, `1..n_review` without gaps. Floats are passed through unrounded.
 
 Everything is computed with float64; no randomness anywhere in this module.
+
+### Money budgets: the `fill` strategy (v1.x, opt-in)
+
+With fraction and count budgets every review costs one unit, and taking the
+top of the `net_benefit` ranking is optimal. With a money budget, review
+costs differ by segment and the problem is a 0/1 knapsack. The default
+`prefix` walk can then stop early and leave budget that cheaper items with
+positive net benefit would fit into. `fill` (`budget.strategy: fill`, or
+`plan`/`run --budget-strategy fill`) allocates as follows:
+
+1. Eligible items: `net_benefit > 0` (rule 6).
+2. Candidate `net_benefit`: the eligible items in the default ranking (rule
+   4).
+3. Candidate `net_benefit_per_cost`: the eligible items ranked by
+   `net_benefit / review_cost` DESC. Items with `review_cost == 0` rank
+   first (ratio +inf). Equal ratios keep the default ranking
+   (`net_benefit` DESC, `item_id` ASC), via a stable sort over it.
+4. Each candidate is walked with skip-and-continue. An item is admitted iff
+   `cumulative + review_cost <= value`. Otherwise it is skipped and the walk
+   goes on. The cumulative sum is accumulated in walk order, exactly like
+   the `prefix` walk.
+5. Objective: total expected net benefit = `math.fsum` of `net_benefit`
+   over the admitted items. The `net_benefit_per_cost` candidate is selected
+   iff its total is strictly greater. Exact ties select `net_benefit`.
+
+Guarantees:
+
+- **Never worse than `prefix`**: candidate `net_benefit` is identical to the
+  prefix walk up to its first non-fitting item (same order, same float
+  accumulation), and after that it only adds items with positive net
+  benefit. The selected candidate is therefore at least as good as `prefix`
+  in total expected net benefit.
+- **At least half of the optimum**: candidate `net_benefit` always contains
+  the best single item that fits. Candidate `net_benefit_per_cost` contains
+  the greedy prefix of the fractional (LP) relaxation. The larger of the two
+  is at least half of the best possible total expected net benefit. On the
+  seeded synthetic data (overconfident, seed 42, stock and widened review
+  costs, budgets 100 to 12,000 cost units) it was within 0.1% of the LP
+  upper bound in every case measured.
+- **Exact threshold replay (rule 7 still applies)**: within one segment
+  every item has the same `review_cost`, and both rankings order a segment
+  exactly like the default ranking. The spend never decreases, so once an
+  item of a segment does not fit, no later item of that segment fits either.
+  Each segment's routed set is therefore a prefix of its ranking, and
+  `p_error_threshold` replays it exactly. Ties at the threshold inflate the
+  replay exactly as with `prefix` (§9.4).
+- **Deterministic**: fixed rankings with `item_id` tie-breaks, no
+  randomness, about one extra sort over the default.
+
+Trade-offs (tracked in docs/risk-register.md R6):
+
+- The objective is net benefit (captured expected loss minus review spend),
+  not captured loss. The selected allocation can capture LESS expected loss
+  than `prefix` and so leave a larger `expected_residual_loss`. A policy
+  that passes `gates.max_residual_risk` under `prefix` can therefore fail it
+  (exit 2) under `fill`. Candidate `net_benefit` alone could not do this,
+  but it is not selected unless it wins on the objective.
+- `fill` spends close to the whole budget. Less slack is left to absorb
+  threshold ties at replay, so `backtest --max-budget-overrun` trips sooner
+  than with `prefix`.
+- The gain is in EXPECTED net benefit. How much of it is realized depends on
+  calibration quality, and the backtest is the place to check that.
+- Exact optimization (dynamic programming over the budget, branch and bound)
+  was rejected. Costs are floats, so DP is exact only after rounding costs
+  to a grid, and its time and memory grow with the budget. Branch and bound
+  has exponential worst-case runtime. Neither is cheaply bit-for-bit
+  reproducible. The bounded greedy above is.
+
+Artifact: a `fill` policy records `budget.strategy: "fill"` (top-level
+`budget` and `config_snapshot.budget`) and a top-level
+`allocation: {"selected_candidate": "net_benefit" | "net_benefit_per_cost"}`
+(§7). A `prefix` policy has neither key, so it is byte-identical to one
+written before the strategy existed.
 
 ## 6. Synthetic generator (`src/triage/synth.py`)
 
@@ -327,9 +442,10 @@ def canonical_dumps(obj: dict) -> str:
     # json.dumps(obj, sort_keys=True, indent=2, allow_nan=False) + "\n"
 def content_hash(obj: dict) -> str:
     # sha256 of canonical_dumps(obj) after deleting keys
-    # "created_at", "policy_hash" and "backtest_hash" (if present) at the
-    # TOP level ("backtest_hash" added in v1; popping an absent key is a
-    # no-op, so all MVP hashes are unchanged)
+    # "created_at", "policy_hash", "backtest_hash" and "comparison_hash"
+    # (if present) at the TOP level ("backtest_hash" added in v1,
+    # "comparison_hash" in v1.x for §14; popping an absent key is a no-op,
+    # so no existing artifact's hash changes)
 def file_sha256(path: Path) -> str
 def write_artifact(obj: dict, path: Path) -> None
 def utc_now_iso() -> str      # timezone-aware UTC, seconds precision
@@ -339,9 +455,12 @@ def utc_now_iso() -> str      # timezone-aware UTC, seconds precision
 `ece_holdout`, `ece_raw_holdout`, `input_sha256`, `method`, `n_golden`,
 `params`, `reliability_bins`, `seed`, `tool_version`.
 
-**policy.json** top-level keys: `budget` (as declared in YAML),
-`config_snapshot` (the full cost YAML as parsed; `gates.ece_gate_mode` is
-present only when non-default, see §3), `created_at`,
+**policy.json** top-level keys: `allocation` (ONLY for `budget.strategy:
+fill`: `{"selected_candidate": "net_benefit" | "net_benefit_per_cost"}`,
+see §5), `budget` (as declared in YAML: `{type, value}`, plus `strategy`
+only when non-default), `config_snapshot` (the full cost YAML as parsed;
+`gates.ece_gate_mode` and `budget.strategy` are present only when
+non-default, see §3), `created_at`,
 `input_sha256s` (`{batch, calibrator, costs}`), `policy_hash`, `segments`
 (name → `{expected_captured_loss, expected_residual_loss, n_review, n_total,
 p_error_threshold}`), `tool_version`, `totals` (`{expected_captured_loss,
@@ -366,6 +485,19 @@ replayed policy's own `policy_hash`, which is the hash-chain link),
 
 `backtest_hash = content_hash(backtest_dict)`.
 
+**review_queue.json** (v1.x, optional; written only when a queue export is
+requested, §10): top-level keys `columns`, `created_at`, `files`, `gates`,
+`input_sha256s`, `n_rows`, `policy_hash`, `queue_hash`, `schema_version`,
+`tool_version`, `totals` — see §10.4. Written with `write_artifact`
+(canonical form). It has no self-hash: nothing downstream consumes it as a
+hash-checked input. Requesting an export changes NO other artifact:
+policy.json, its `policy_hash`, backtest.json and report.html are identical
+with and without it.
+
+
+**comparison.json** (v1.x, §14.10): written by `triage compare` to
+`<-o DIR>/comparison.json`; `comparison_hash = content_hash(comparison_dict)`.
+
 ## 8. CLI (`src/triage/cli.py`)
 
 Typer app, entry point `triage` (pyproject `[project.scripts]`).
@@ -375,7 +507,8 @@ triage synth --scenario overconfident --seed 42 -o data/
 triage calibrate --golden data/golden.parquet --seed 42 [--max-ece F] \
             [--ece-gate-mode point|ci_upper] -o artifacts/calibrator.json
 triage plan --batch data/batch.parquet --calibrator artifacts/calibrator.json \
-            --costs costs.yaml [--budget F] -o artifacts/policy.json
+            --costs costs.yaml [--budget F] [--budget-strategy prefix|fill] [--queue-csv PATH] [--queue-parquet PATH] \
+            -o artifacts/policy.json
 triage backtest --policy artifacts/policy.json --calibrator artifacts/calibrator.json \
             --history data/history.parquet [--seed 42] [--n-random-draws 200] \
             -o artifacts/backtest.json
@@ -419,11 +552,17 @@ triage backtest --policy artifacts/policy.json --calibrator artifacts/calibrator
   backtest_hash prefix, output path) and exits 0.
 
 ```
-triage report --from artifacts/ -o report.html
+triage report --from artifacts/ -o report.html          # single-policy report (§11)
+triage report --compare comparison_dir/ -o compare.html # policy comparison (§14.8)
 ```
 
-`report` pinned behavior (v1 part 2):
+`report` pinned behavior (v1 part 2; `--compare` v1.x):
 
+- Exactly one of `--from DIR` or `--compare DIR` (both or neither is a
+  `ContractViolation`, exit 1, nothing written). `--compare DIR` reads
+  `DIR/comparison.json` (missing/unparseable/not an object is exit 1) and
+  renders it with `compare_report.render` (§14.8). `run` always calls the
+  report stage with `compare_dir=None`.
 - `--from DIR`: reads `DIR/calibrator.json` and `DIR/policy.json`
   (REQUIRED — missing or unparseable is `ContractViolation`, exit 1) and
   `DIR/backtest.json` (OPTIONAL — absent file ⇒ `backtest_dict=None`;
@@ -438,61 +577,10 @@ triage report --from artifacts/ -o report.html
   command validates its options in ONE function, called before it reads or
   writes anything: `_synth_preflight` (scenario name via
   `synth.validate_scenario`, seed), `_calibrate_preflight` (seed, and the
-  gate flags via `costs.Gates`), and `_backtest_preflight` (seed,
-  `backtest.validate_n_random_draws`, `backtest.validate_max_budget_overrun`).
-  `run` calls the same preflights with the exact arguments it later passes to
-  each stage. So `run` and the individual commands accept and reject exactly
-  the same inputs, with the same messages. `plan --budget` is validated by
-  `costs.Budget` in both paths. Consequence for `backtest`: an invalid
-  `--max-budget-overrun`, `--n-random-draws` or `--seed` is now rejected
-  before the replay runs, so no `backtest.json` is written for it.
-- `--seed` is required-explicit where randomness exists (`synth`, `calibrate`);
-  no hidden defaults (typer default allowed but must be a literal, documented).
-  Pin: default `--seed 42` on both, shown in help.
-- `--budget` (plan) overrides `budget.value` from the YAML, keeping
-  `budget.type`.
-- `calibrate` gating: if `--max-ece` given, run `check_ece_gate` with
-  `--ece-gate-mode` (default `point`) (exit 3). The artifact is written
-  first. The two flags are validated BEFORE fitting, using the same
-  `costs.Gates` rules as the YAML (§3): `--max-ece` in `(0, 1]` (NaN
-  rejected), mode in {`point`, `ci_upper`}, and `ci_upper` requires
-  `--max-ece`. A violation is exit 1 and nothing is written. On success with
-  a gate, the summary line appends
-  `ece_gate=<mode> <checked field>=<value><=max_ece=<threshold>`.
-- `plan` gating order: write policy.json, then `check_ece_gate` against
-  `gates.max_ece` with `gates.ece_gate_mode` from the YAML (exit 3), then
-  `check_residual_gate` (exit 2). `plan` has no `--ece-gate-mode` flag. The
-  YAML is the single source, so the mode that was checked is exactly the
-  one recorded in `config_snapshot`.
-- `plan`'s `input_sha256s`: `batch` and `costs` are `file_sha256` of raw
-  bytes; `calibrator` is `content_hash` of the PARSED artifact dict
-  (semantic hash, `created_at` excluded). The calibrator file embeds its own
-  timestamp, so hashing bytes would make `policy_hash` depend on when the
-  calibrator was fitted rather than on what it computes, breaking golden-file
-  reproducibility across independent end-to-end runs.
-- Exit-code mapping in ONE place (a `main`-level try/except):
-  `ContractViolation → 1`, `ResidualRiskExceeded → 2`,
-  `CalibrationGateFailed → 3`, `BudgetOverrunExceeded → 5`,
-  other `Exception → 4` (message to stderr,
-  traceback only with `--verbose`). Success prints a one-line summary to
-  stdout and exits 0.
-- Pinned: the typer app runs with `standalone_mode=False`; bad CLI usage
-  (unknown flag, missing option) maps to exit 1 — it is an input contract
-  violation, and click's default usage-error code 2 would collide with the
-  residual-risk gate meaning. `app_main` uses `sys.exit`, never `typer.Exit`
-  outside the runner (it is not honored there).
-
-### `run` — the whole chain in one command (v1.x)
-
-```
-triage run (--scenario S | --golden G --batch B --costs C [--history H]) [--seed 42]
-           [--budget F] [--max-ece F] [--ece-gate-mode point|ci_upper]
-           [--max-residual-risk F] [--max-budget-overrun F] [--n-random-draws 200]
-           [--fail-fast] -o RUN_DIR
-```
-
-Pinned behavior:
-
+  gate flags via `costs.Gates`), `_backtest_preflight` (seed,
+  random draws and budget overrun), `_plan_preflight` (queue export paths),
+  and `_compare_preflight` (bootstrap options; regression gating requires
+  `--n-bootstrap > 0`).
 - **Same code, same artifacts.** `run` calls the `synth`, `calibrate`,
   `plan`, `backtest`, and `report` command functions in that order. It adds
   no semantics of its own. Its artifacts equal the manual chain's (minus
@@ -505,9 +593,18 @@ Pinned behavior:
   stage (synth, calibrate, backtest random baseline).
 - **Layout**: `RUN_DIR/costs.yaml` (the effective cost model `plan` reads),
   `RUN_DIR/artifacts/{calibrator,policy,backtest}.json`,
-  `RUN_DIR/report.html`, plus `RUN_DIR/data/` in synthetic mode.
-- **Overrides** `--budget`, `--max-ece`, `--ece-gate-mode`,
-  `--max-residual-risk` patch the source YAML's `budget.value` / `gates.*`.
+  `RUN_DIR/report.html`, plus `RUN_DIR/data/` in synthetic mode, plus (v1.x,
+  only with `--queue-format`) `RUN_DIR/artifacts/review_queue.{csv,parquet}`
+  for each requested format and `RUN_DIR/artifacts/review_queue.json`.
+- **Queue export** (v1.x): `--queue-format` is repeatable (`csv`, `parquet`;
+  repeats are harmless; any other value, case-sensitive, is exit 1). It is
+  forwarded to the plan stage as `queue_csv` / `queue_parquet` = the layout
+  paths above (or None), so `run` exports exactly what `plan --queue-csv
+  ... --queue-parquet ...` exports (byte-identical files, manifests equal
+  minus `created_at`). With `--fail-fast` and a calibrate-stage gate failure,
+  plan never runs and no queue is written.
+- **Overrides** `--budget`, `--budget-strategy`, `--max-ece`, `--ece-gate-mode`,
+  `--max-residual-risk` patch the source YAML's `budget.value` / `budget.strategy` / `gates.*`.
   The result is validated as a `CostModel` and written to
   `RUN_DIR/costs.yaml` (sorted keys). Without overrides the source bytes are
   copied verbatim, so `input_sha256s.costs` equals the source file's hash.
@@ -518,8 +615,9 @@ Pinned behavior:
   the stage preflights above (synth, calibrate with the effective gates, and
   backtest), plus run-only rules: mode exclusivity/completeness, input files
   exist, overrides valid as a `CostModel`, `--max-budget-overrun` only with
-  a history, `RUN_DIR` not a file, and no input path equal to a file `run`
-  writes.
+  a history, `RUN_DIR` not a file, no input path equal to a file `run`
+  writes, valid `--queue-format` values, and `_plan_preflight` with the
+  exact queue arguments the plan stage will receive.
 - **No silent drift from the commands**: `run` refuses (internal error) to
   call a stage whose parameter set differs from the arguments it passes. A
   command option that `run` does not forward therefore fails loudly instead
@@ -529,6 +627,9 @@ Pinned behavior:
   chain vs `run`: per-stage exit codes, gate messages, artifacts, report).
 - **Stale outputs**: after validation, the files `run` writes (the layout
   above) are deleted if present. Other files in `RUN_DIR` are untouched.
+  The three queue paths are ALWAYS owned, with or without `--queue-format`:
+  a rerun never leaves a queue next to a policy it does not belong to, and
+  an input file stored at one of those paths is rejected (exit 1).
 - **Gates**: a stage's gate exception (exit 2/3/5) is recorded, and the run
   continues (artifact-first, so every artifact and the report exist). At the
   end, `run` prints a one-line summary (`run: <stage>=ok|FAIL(exit N) ...`)
@@ -591,14 +692,23 @@ Pinned semantics (do not improvise):
    wrap `ValidationError` in `ContractViolation`. Missing/malformed policy
    keys are `ContractViolation`s, never `KeyError`s.
 3. `history` is validated with `contract.validate(history, require_truth=True)`.
-4. **Policy strategy (threshold replay)**: `p_error =
+4. **Policy strategy (threshold replay)** — implemented ONCE, in
+   `replay_thresholds(policy_segments, p_error, segments) -> Replay`
+   (`reviewed` mask + the threshold applied per segment), and accounted
+   ONCE, in `policy_outcome(replay, segments, true_loss, review_costs,
+   total_true_loss, *, segment_review_spend=False)` (the
+   `strategies.policy` dict of point 8). `compare` (§14) uses the same two
+   functions, so the two commands cannot disagree on which items a policy
+   reviews or on how they are summed. `p_error =
    calibrator.predict(score)`; review iff the item's segment has a non-null
    `p_error_threshold` in `policy_dict["segments"]` AND
    `p_error >= threshold`. Segments unseen at plan time (absent from
    `policy_dict["segments"]`) are never reviewed — a policy must apply to
    future data without crashing; unseen ⇒ same semantics as a null threshold.
    Costs for such segments still resolve via `costs_for` (default fallback;
-   no default ⇒ `ContractViolation`, consistent with §3).
+   no default ⇒ `ContractViolation`, consistent with §3). Replay does not
+   depend on `budget.strategy`: both money strategies route a per-segment
+   prefix (§5), so thresholds describe either one.
    **Tie inflation is expected and correct**: isotonic calibrators are step
    functions, so multiple items can sit exactly AT the threshold and the
    replayed review set can exceed the planned `n_review` (measured at seed
@@ -654,6 +764,10 @@ Pinned semantics (do not improvise):
       `item_id` ASC tie-break — same two-stable-sorts idiom), i.e.
       `fsum(true_loss over top-k) / total_true_loss` (0.0 everywhere if
       `total_true_loss == 0`).
+      This is the default ranking whatever the policy's `budget.strategy`:
+      a `fill` policy whose `net_benefit_per_cost` candidate won is not the
+      top-`k` of this ranking, so the curve is a count-based reference
+      there, not a replay of that policy.
     - `curves.raw_confidence[j]`: same, ranking by `score` ASC, `item_id`
       ASC.
     - `curves.random[j]`: `k / n_history` exactly (the analytic expectation
@@ -664,6 +778,140 @@ Pinned semantics (do not improvise):
       published thresholds (tie inflation, §9.4). Both are correct answers
       to different questions; measured at seed 42, overconfident:
       curve 0.4420 at f=0.10 vs capture_rate 0.5029 at 1183 replayed items.
+
+## 10. Review queue export (`src/triage/review_queue.py`) — v1.x
+
+Optional, per-item export of the review set `plan` selected, for a human
+review workflow. It is a VIEW of the plan: requesting it changes no other
+artifact or hash (§7). Nothing here recomputes a selection; the module only
+serializes `PlanResult.review_queue` (§5.10).
+
+### 10.1 Why a queue and not the thresholds
+
+policy.json publishes per-segment `p_error_threshold`s. Replaying them
+(`p_error >= threshold`, §9.4) admits every item tied AT a threshold, while
+the optimizer admitted only the tied items its ranking reached before
+capacity ran out (`item_id` ASC decides within a tie). Measured: overconfident
+@ seed 42 plans 1000 reviews, threshold replay admits 1183 (280 seg_high items
+sit exactly at the threshold, 97 of them planned); the golden chain
+well_calibrated @ seed 7 plans 1000, replay admits 1044. The queue carries
+the optimizer's own selection. Per segment the relation is exact:
+`{p_error > threshold} ⊆ queue ⊆ {p_error >= threshold}` — only items AT the
+threshold are ambiguous, and the queue resolves them.
+
+### 10.2 Queue schema (CSV and Parquet)
+
+One row per routed item, in priority order. Column order and dtypes are
+pinned (`optimizer.REVIEW_QUEUE_SCHEMA`):
+
+| column | dtype | meaning |
+|--------|-------|---------|
+| `review_priority` | Int64 | 1-based rank in the optimizer's ranking (§5.4); `1..n_review`, no gaps (§5.10) |
+| `item_id` | String | |
+| `segment` | String | as in the batch (an unseen segment keeps its name; its costs come from `default`) |
+| `p_error` | Float64 | calibrated error probability |
+| `false_accept_cost` | Float64 | resolved via `costs_for` |
+| `expected_loss` | Float64 | `p_error * false_accept_cost`, exactly as the optimizer computed it |
+| `review_cost` | Float64 | resolved via `costs_for` |
+| `net_benefit` | Float64 | `expected_loss - review_cost`: the ranking key; always `> 0` |
+| `policy_hash` | String | the plan's `policy_hash` (same on every row) |
+| `batch_sha256` | String | `policy.input_sha256s.batch` (same on every row) |
+
+- Floats are written unrounded. Parquet stores float64 exactly; the CSV
+  writer emits shortest round-trip representations, so reading the CSV back
+  with the schema above (never inferred dtypes — an `item_id` like `000123`
+  would lose its zeros) yields bit-identical values.
+- An EMPTY selection (fraction flooring to 0, money below the first ranked
+  item's cost, or no item with `net_benefit > 0`) writes a header-only CSV
+  and a zero-row Parquet file with the same schema.
+- Row content is independent of the batch's row order; only the two trace
+  columns change with the batch FILE (its sha256, hence `policy_hash`).
+
+### 10.3 Gate outcome
+
+`GateStatus(status, failed)`: `status` is `"pass"` or `"failed"`; `failed`
+lists the failed plan gates in check order, a subset of
+`("max_ece", "max_residual_risk")`. A gate that is not declared (null) never
+appears. Invalid combinations (`pass` with names, `failed` without) raise
+`ValueError`. The CLI evaluates the gates before writing the queue (§8,
+`plan` gating order) so the record is real, not assumed. Invariant:
+`gates.status == "pass"` iff `plan` exits 0.
+
+A queue is written EVEN WHEN a gate fails (artifact-first, like every
+artifact here). Consumers feeding a human review workflow must check
+`gates.status` (or `plan`'s exit code) before acting on it — see
+docs/risk-register.md R5.
+
+### 10.4 Manifest `review_queue.json`
+
+```python
+MANIFEST_NAME = "review_queue.json"
+SCHEMA_VERSION = 1
+
+def write_csv(review_queue: pl.DataFrame, path: Path) -> None
+def write_parquet(review_queue: pl.DataFrame, path: Path) -> None
+def queue_hash(review_queue: pl.DataFrame) -> str
+def build_manifest(review_queue, *, policy_hash, input_sha256s, totals,
+                   files: dict[str, Path], gate_status: GateStatus,
+                   tool_version: str, created_at: str) -> dict[str, Any]
+def export(review_queue, *, csv_path: Path | None, parquet_path: Path | None,
+           manifest_path: Path, policy_hash, input_sha256s, totals,
+           gate_status, tool_version, created_at) -> dict[str, Any]
+```
+
+Keys (§7): `columns` (the queue's column list), `created_at` (the SAME
+timestamp as the policy.json written by the same `plan`), `files` (per
+written format, `{"path": <file NAME>, "sha256": file_sha256}` — names
+only, never directories, so manifests are comparable across output
+locations), `gates` (§10.3), `input_sha256s` (copied from the policy),
+`n_rows`, `policy_hash`, `queue_hash`, `schema_version` (1), `tool_version`,
+`totals` (the policy's `expected_captured_loss`, `n_review`,
+`review_spend`, copied verbatim).
+
+`queue_hash = content_hash({"rows": review_queue.to_dicts()})`: a hash of
+the rows, independent of the file format (a CSV and a Parquet export of the
+same queue hash identically) and of the Parquet writer version — unlike
+`files.*.sha256`, which hashes bytes. It is order-sensitive (priority is
+content). The manifest is what makes an EMPTY CSV traceable: a header-only
+file carries no row to hold a hash.
+
+`export` writes the requested file(s), then builds the manifest from the
+files actually on disk, then writes it. At least one format is required
+(`ValueError` otherwise — a programming error; the CLI never calls it
+without one).
+
+### 10.5 CLI
+
+`plan --queue-csv PATH` and/or `--queue-parquet PATH`; the manifest is
+written as `review_queue.json` in the directory of the export(s). The
+summary line appends ` queue=<n_rows> rows -> <manifest path>`.
+`_plan_preflight` rejects, before anything is read or written (exit 1):
+
+- a `--queue-csv` not ending in `.csv` / a `--queue-parquet` not ending in
+  `.parquet` (case-insensitive);
+- both given in different directories (the manifest records file names);
+- any queue file or the manifest resolving to `--batch`, `--calibrator`,
+  `--costs` or `--output` (e.g. `-o out/review_queue.json` with
+  `--queue-csv out/q.csv`);
+- any of them existing as a directory.
+
+`plan` never deletes files: re-exporting a different format set into the
+same directory leaves the previous export of the other format in place
+(the new manifest lists only what it wrote). `run` owns its queue paths
+and removes stale ones (§8).
+
+`run --queue-format csv|parquet` (repeatable): §8.
+
+### 10.6 Guarantees (tests/invariants/test_review_queue.py, test-spec §K)
+
+Exact equality, never tolerances: `n_rows == totals.n_review`; per segment
+row count `== n_review`, `fsum(expected_loss) == expected_captured_loss`,
+`min(p_error) == p_error_threshold` (no rows ⇔ null); the sequential sum
+of those per-segment fsums in sorted order `== totals.expected_captured_loss`;
+`fsum(review_cost) == totals.review_spend` (fsum is correctly rounded,
+hence order-independent, which is why these tie out bit for bit); together
+with the batch, per-segment residuals reconcile too. Trace columns equal
+`content_hash(policy)` and `file_sha256(batch)`.
 
 ## 11. Report (`src/triage/report.py`) — v1.1 (redesign)
 
@@ -854,7 +1102,11 @@ Four tiles, in this order, each with `data-kpi`:
 | `residual` | Risk left unreviewed | `strategies.policy.residual_loss` (plan expected + ratio; declared limit if any) | `policy.totals.expected_residual_loss`, labelled "expected" (declared limit if any) |
 
 Budget display by `budget.type`: `fraction` → "budget 10%"; `count` →
-"budget 1,000 items"; `money` → "budget 4,000 cost units". The `residual`
+"budget 1,000 items"; `money` → "budget 4,000 cost units". A money budget
+with a non-default `budget.strategy` appends the strategy and the selected
+candidate from `policy.allocation`: "budget 4,000 cost units (fill strategy,
+net-benefit-per-cost ranking)" (or "…, net-benefit ranking"; "(fill
+strategy)" alone if `allocation` is absent). The `residual`
 value is coloured red if a residual-risk gate check failed, amber if
 `plan.vs_actual` is `warn`, neutral otherwise (never green: a number alone
 is not a verdict).
@@ -903,7 +1155,18 @@ container; fixed height), direct labels preferred over legends:
 
 ### 11.11 Visual system, formatting, template
 
-1. **Palette** (pinned in report.py; the report owns it):
+0. **Shared with the comparison page (v1.x).** Palette, number filters,
+   figure layout (`base_layout`, `to_html`), the Jinja environment
+   (`environment()`), and the display lookups `segment_cost` /
+   `budget_label` live in `src/triage/render_utils.py`; `report.py` and
+   `compare_report.py` both import them (the `fmt_*` filters stay
+   importable from `triage.report`). The page shell (CSS, header, footer) is
+   `templates/_base.html.j2`; the status badge, checks list and audit
+   section are macros in `templates/_macros.html.j2`. Both
+   `report.html.j2` and `compare.html.j2` extend / import them. The
+   refactor was verified byte-identical on every scenario before the one
+   intentional change below (per-segment table fix).
+1. **Palette** (pinned in render_utils.py, shared by both pages):
    series: policy `#2a78d6`, raw confidence `#7c5cc4`, random `#9aa1a9`;
    status: ok `#15803d`, attention `#d97706`, failed `#dc2626`, info/neutral
    `#64748b`; ink `#1f2933`. Status colours are reserved for verdicts, and no
@@ -919,7 +1182,9 @@ container; fixed height), direct labels preferred over legends:
    `count` → `{:,d}` (1,183); `cost` → `{:,.0f}` (336,100);
    `pct` → share × 100 with 1 decimal + "%" (41.9%); `ratio` → `{:.2f}×`
    (2.36×); `lift` → `{:.1f}×` below 10, `{:.0f}×` from 10 (4.2×, 20×);
-   `ece` → `{:.3f}`. `None` renders as "—" in every filter.
+   `ece` → `{:.3f}`. `None` renders as "—" in every filter. Deltas (v1.x,
+   comparison page): `signed_cost` / `signed_count` → explicit `+`,
+   U+2212 minus, and a bare `0` for anything that rounds to zero.
 4. **Template** is a package resource: `src/triage/templates/report.html.j2`,
    loaded with `jinja2.Environment(loader=PackageLoader("triage"),
    autoescape=True, keep_trailing_newline=True)`. Template partials/macros
@@ -948,6 +1213,11 @@ container; fixed height), direct labels preferred over legends:
   unchanged). Its heading is no longer followed by a "Backtest" `<h2>`
   (tests that sliced `<h2>Gates</h2>…<h2>Backtest</h2>` move to `#gates`).
 - Plan-only note unchanged in meaning; now placed in the results slot.
+- v1.x fix: every per-segment data row rendered one extra, empty cell
+  (a stray `{{ row.checked }}` copied from the gates table), so each value
+  from "cost per miss / review" onward sat one column right of its
+  heading. Rows now have exactly the header's cells; invariant G.10 guards
+  every table on both pages.
 
 ## 12. CI workflow (`.github/workflows/ci.yml`) — v1
 
@@ -974,3 +1244,202 @@ Example workflow, also the repo's own CI. Two jobs:
 - File ownership per work package is exclusive: an agent touches ONLY its
   assigned files (plus nothing in `docs/`). Shared helpers live in
   `artifacts.py` / `exceptions.py`, created in Stage 0.
+
+## 14. Policy comparison (`src/triage/compare.py`, `src/triage/compare_report.py`) — v1.x
+
+Answers one practical question before a policy change: *does the candidate
+improve on the current policy, and what happens to the human review
+workload?* Both policies are replayed on the SAME labeled history, each with
+its OWN calibrator, and priced by ONE explicit cost basis.
+
+### 14.1 CLI
+
+```
+triage compare --current-policy P --current-calibrator C \
+               --candidate-policy P2 --candidate-calibrator C2 \
+               --history H [--eval-costs costs.yaml] \
+               [--seed 42] [--n-bootstrap 1000] [--ci-level 0.95] \
+               [--fail-on-regression] -o DIR
+triage report --compare DIR -o comparison.html
+```
+
+- `-o DIR` is a directory (created if needed; an existing FILE is exit 1);
+  `compare` writes `DIR/comparison.json`. `report --compare DIR` reads it
+  (directory symmetry with `report --from DIR`).
+- Options are validated by `_compare_preflight` before anything is read or
+  written (§8): seed as everywhere, `--n-bootstrap` int >= 0 (0 = no CI),
+  `--ci-level` in (0, 1) (NaN rejected), `--fail-on-regression` requires
+  `--n-bootstrap > 0`.
+- `--history` is read with `require_truth=True`; `--eval-costs` with
+  `costs.load` (same YAML as `plan`; its `budget`/`gates` are ignored).
+- Artifact-first: `comparison.json` is written, THEN the optional gate runs
+  (exit 6). Success prints one line: `verdict=<point> (ci: <ci>)
+  d_captured=… d_reviews=… d_spend=… d_total_cost=… basis=<source>
+  comparison_hash=<12 hex> -> <path>`.
+- No randomness except the seeded bootstrap; `run` does not call `compare`.
+
+```python
+def run(*, current_policy, current_calibrator, candidate_policy,
+        candidate_calibrator, history: pl.DataFrame, history_sha256: str,
+        eval_costs: CostModel | None = None, eval_costs_sha256: str | None = None,
+        seed: int = 42, n_bootstrap: int = 1000, ci_level: float = 0.95,
+        tool_version: str) -> ComparisonResult
+def check_regression_gate(result: ComparisonResult) -> None   # exit 6
+def validate_uncertainty_options(seed, n_bootstrap, ci_level) -> None
+```
+
+Policies/calibrators are PARSED artifact dicts; `history_sha256` /
+`eval_costs_sha256` are raw-file hashes from the CLI (given together with
+`eval_costs`, or not at all).
+
+### 14.2 Artifact relationships (verified in `compare.run`, before evaluating)
+
+Per side (`current`, `candidate`), every link RECOMPUTED, never trusted:
+the policy has `policy_hash`, `config_snapshot`, `segments`, `totals`
+(`n_review`, `n_total`) and `budget`; `content_hash(policy) ==
+policy.policy_hash`; `content_hash(calibrator) ==
+policy.input_sha256s.calibrator`; the calibrator parses
+(`Calibrator.from_dict`); `config_snapshot` validates as a `CostModel`.
+Every failure is a `ContractViolation` naming the side. If BOTH calibrators
+mismatch and each matches the OTHER policy, the message says the
+calibrators are swapped; a single mismatch names the other policy when the
+calibrator belongs to it. Two policies may share one calibrator.
+
+### 14.3 Evaluation
+
+`true_loss = (predicted_value != true_value) * false_accept_cost` and
+spend `= review_cost`, both from the BASIS (§14.4), so `total_true_loss` is
+shared by the two sides. Each side: `p_error = own_calibrator.predict(score)`,
+`backtest.replay_thresholds` (§9.4: review iff threshold non-null and
+`p_error >= threshold`; never capped), `backtest.policy_outcome` with
+`segment_review_spend=True`, plus `total_cost = residual_loss +
+review_spend` (overall and per segment). Consequence, tested: under a
+policy's own costs its outcome equals its `backtest.json`
+`strategies.policy` exactly.
+
+`delta = candidate - current` for `captured_loss`, `residual_loss`,
+`n_review`, `review_spend`, `total_cost`, overall and per history segment.
+`overlap`: `both`, `current_only`, `candidate_only` (each `n_review`,
+`captured_loss`, `review_spend`, as `math.fsum`s) and `neither`
+(`n_items`). Identities (tested): `delta.residual_loss ==
+-delta.captured_loss` and `delta.captured_loss ==
+candidate_only.captured_loss - current_only.captured_loss`, both up to
+float rounding; the four overlap groups partition the history.
+
+### 14.4 Evaluation cost basis
+
+Each history segment is resolved under each policy's `config_snapshot`
+(exact key, else `default`, else unpriceable).
+
+- **No `--eval-costs`** (`basis.source = "policies"`): both sides must
+  resolve every HISTORY segment to identical `(false_accept_cost,
+  review_cost)`. Otherwise `ContractViolation` listing every conflicting or
+  unpriceable segment with both sides' prices, pointing at `--eval-costs`.
+  Segments absent from the history, budgets and gates may differ freely.
+- **`--eval-costs`** (`basis.source = "eval_costs"`): the supplied model
+  prices both sides; it must price every history segment (else exit 1).
+  `basis.ignored_eval_costs_fields = ["budget", "gates"]`.
+
+`basis.segments` is the resolved table actually used;
+`basis.differences[side]` maps each history segment where the side's OWN
+costs differ from the basis to those own costs (null = unpriceable);
+`basis.planned_under_basis[side]` is true iff that map is empty.
+
+### 14.5 Segments
+
+Per side and history segment, `status`: `planned` (non-null threshold),
+`no_threshold` (in the plan, null threshold) or `not_in_plan` (absent from
+the policy: unseen at plan time). The last two review nothing; the report
+says which. `policies.<side>.planned_segments_not_in_history` lists policy
+segments the history does not contain (reported, never evaluated).
+
+### 14.6 Point verdict
+
+Directions for `captured_loss` (higher is better), `n_review` and
+`review_spend` (lower is better): `better` / `worse` / `same`. Label:
+`no_change` (all same), `improvement` (some better, none worse),
+`regression` (some worse, none better), `trade_off` (both).
+`verdict.total_cost` is the direction of total cost (lower is better): it
+says whether a trade-off pays off under the basis. Directions compare
+correctly-rounded `math.fsum`s over the DIFFERING items only (e.g.
+`fsum(loss of candidate_only)` vs `fsum(loss of current_only)`), so two
+review sets with equal exact sums never yield a ±1 ULP verdict, whatever
+the grouping of the reported totals.
+
+### 14.7 Uncertainty: paired bootstrap
+
+`n_bootstrap` resamples of the history items with replacement
+(`np.random.default_rng(seed).integers(0, n, size=n)`, same idiom as the
+calibration CI). Each item's review decision is fixed by the thresholds, so
+a resampled delta is a `math.fsum` over the differing items weighted by
+their resample counts. Percentile CI at `ci_level` (`np.percentile`,
+`(1 - ci_level) / 2` each side). `uncertainty = {method:
+"paired_bootstrap", n_bootstrap, seed, ci_level, n_differing_items,
+delta_ci: {captured_loss, residual_loss, n_review, review_spend,
+total_cost: [lo, hi]}}`, or `null` when `n_bootstrap == 0`.
+
+CI directions: `better`/`worse` only when the CI excludes 0; `same` when no
+item differs or the CI is exactly `[0, 0]`; otherwise `inconclusive`.
+`verdict.ci = {label, directions, total_cost}` applies the §14.6 rule to
+those directions, with the extra label `inconclusive` when nothing is
+significant; `null` without a bootstrap.
+
+### 14.8 Comparison page (`compare_report.render`)
+
+```python
+def render(comparison_dict: dict[str, Any], *, created_at: str, tool_version: str) -> str
+```
+
+Pure (byte-identical for identical input; `created_at` on exactly one line,
+`<p id="created-at" class="meta">`), self-contained (plotly.js embedded once,
+after the at-a-glance section and before the first figure), same shell,
+palette, filters and macros as §11 (§11.11.0).
+
+**Verification boundary.** The page receives `comparison.json` ONLY. It
+recomputes `comparison_hash`, and checks the internal accounting: required
+keys; `delta == candidate - current` exactly; each side's `residual_loss ==
+total_true_loss - captured_loss`; overlap counts add up to each side's
+`n_review` and to `n_history`; `input_sha256s.<side>_policy/_calibrator`
+equal the per-side hashes. Any failure is a `ContractViolation` (exit 1),
+never a `KeyError`. The policy↔calibrator relationships are verified by
+`compare`, which never writes a comparison for a broken chain, so the
+header says "comparison verified" (not "artifact chain verified").
+
+Displayed verdict: `verdict.ci` when present, else the point verdict.
+`main` carries `data-status` (`failed` = exactly the §14.9 gate condition
+when a CI exists, or a point `regression` without one; `attention` =
+trade-off; `ok` = improvement; `neutral` = no change / inconclusive),
+`data-verdict` and `data-basis`. Sections, in order: `#at-a-glance` (status
+badge, headline, lede, four KPI tiles `data-kpi` =
+`captured|residual|reviews|spend` with `data-direction`, checks list),
+`#results` (per-side budget/plan, `fig-compare`, current/candidate/change/CI
+table), `#segments` (`fig-compare-segments`, per-segment table with
+`data-segment`, per-side cells `data-side` + `data-status`), `#workload`
+(review-queue overlap), `#uncertainty`, `#basis`, `#audit`. Check ids:
+`verdict.total_cost`, `basis.eval_costs` | `basis.shared`,
+`basis.planned_under_other_costs.<side>`, `segments.not_in_plan.<side>`,
+`segments.not_in_history.<side>`, `uncertainty.inconclusive` |
+`uncertainty.not_computed`.
+
+### 14.9 Regression gate (`--fail-on-regression`, exit 6)
+
+`check_regression_gate` raises `CandidateRegression` iff the candidate is
+SIGNIFICANTLY worse: `verdict.ci.total_cost == "worse"` (total cost CI
+entirely above 0) OR `verdict.ci.label == "regression"`. It reads only the CI
+verdict, so noise (an `inconclusive` difference) never fails CI. Without a
+bootstrap it is a `ContractViolation`. The message names the basis and each
+reason with its CI.
+
+### 14.10 `comparison.json`
+
+Top-level keys: `basis` (§14.4), `comparison_hash`, `created_at`, `delta`
+(§14.3, with `segments`), `history` (`n_history`, `n_errors`,
+`total_true_loss`), `input_sha256s` (`current_policy`,
+`current_calibrator`, `candidate_policy`, `candidate_calibrator` — semantic
+content hashes; `history` — file sha256; `eval_costs` — file sha256 or
+null), `overlap` (§14.3), `policies.<side>` (`budget`, `calibrator_hash`,
+`calibrator_method`, `outcome` (§14.3, segments with `status`,
+`review_spend`, `total_cost`), `planned` (`n_review`, `n_total` from the
+policy's totals), `planned_segments_not_in_history`, `policy_hash`,
+`policy_input_sha256s`), `tool_version`, `uncertainty` (§14.7),
+`verdict` (`label`, `directions`, `total_cost`, `ci`).

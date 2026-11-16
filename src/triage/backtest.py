@@ -1,33 +1,25 @@
 """Backtester: replay a policy against labeled history vs random/raw-confidence baselines.
 
-All "loss" quantities computed here are REALIZED (ground-truth) losses:
+All "loss" quantities here are REALIZED (ground-truth) losses:
 ``true_loss(item) = (predicted_value != true_value) * false_accept_cost(segment)`` —
-not the calibrated expectation the optimizer used to plan the policy.
+not the calibrated expectation the optimizer planned with.
 
-Accounting convention (see docs/interfaces.md §9, point 9): for the "policy"
-strategy the per-segment `captured_loss`/`residual_loss` values are independent
-`math.fsum`s, and the strategy-level `captured_loss` is the sequential sum of
-those per-segment values in sorted-segment order (matching the optimizer's
-tie-out convention). The strategy-level `residual_loss`, however, is NOT the
-sequential sum of per-segment residuals — it is defined as
-`total_true_loss - captured_loss`, because two independently-computed fsums
-are not guaranteed to satisfy `captured + residual == total` at ULP level.
-The same `total_true_loss - captured_loss` definition is used for
-`raw_confidence` and `random` (mean-based), which have no per-segment table.
+Accounting (docs/interfaces.md §9.9): the policy's per-segment captured/residual
+losses are independent `math.fsum`s, and its strategy-level `captured_loss` is
+their sequential sum in sorted-segment order (the optimizer's tie-out rule).
+Every strategy's residual is `total_true_loss` minus its captured loss (the
+mean, for random), not a sum of residuals: two independent fsums need not add
+up to the total at ULP level.
 
-Capacity-sweep curves (see docs/interfaces.md §9.11): `curves.policy` and
-`curves.raw_confidence` are cumulative true-loss SHARES captured when
-reviewing the top-`k` items of a ranking computed fresh on THIS history, at
-each of 51 grid capacities `k = floor(f * n_history)` for `f` in
-`[0.00, 0.02, ..., 0.50]`. `curves.random` is the analytic expectation
-`k / n_history` (no Monte Carlo). PINNED DIVERGENCE: `curves.policy` at the
-policy's own budget fraction may differ from `strategies.policy.capture_rate`
-— the curve reviews exactly `k` ranked items, while `strategies.policy`
-replays the published per-segment thresholds, which can admit more items
-than planned when the calibrator is a step function and multiple items sit
-exactly at the threshold (tie inflation, point 4 above). Both are correct
-answers to different questions; measured at seed 42, overconfident scenario:
-curve 0.4420 at f=0.10 vs capture_rate 0.5029 at 1183 replayed items.
+Curves (§9.11): cumulative true-loss shares of the top-`k` items of a ranking
+computed fresh on THIS history, for `k = floor(f * n_history)`,
+`f = 0.00, 0.01, ..., 0.50`; `curves.random` is the analytic `k / n_history`.
+`curves.policy` always uses the default net_benefit ranking, whatever the
+policy's `budget.strategy`. PINNED DIVERGENCE: at the policy's own budget
+fraction it may differ from `strategies.policy.capture_rate`, which replays
+the published thresholds and can admit more items than planned when items tie
+exactly at a threshold (§9.4). Measured at seed 42, overconfident: curve
+0.4420 at f=0.10 vs capture_rate 0.5029 at 1183 replayed items.
 """
 
 import math
@@ -46,6 +38,9 @@ from triage.optimizer import PredictsErrors
 
 __all__ = [
     "BacktestResult",
+    "Replay",
+    "policy_outcome",
+    "replay_thresholds",
     "run",
     "check_realized_residual_gate",
     "check_budget_overrun_gate",
@@ -55,9 +50,9 @@ __all__ = [
 
 
 def validate_n_random_draws(n_random_draws: int) -> None:
-    """n_random_draws must be an integer >= 0 (0 = no random draws; the
-    random baseline then reports zeros). Negative counts used to crash inside
-    numpy (exit 4) instead of being reported as a contract violation."""
+    """n_random_draws must be an integer >= 0 (0 = no draws; the random
+    baseline then reports zeros). Checked here so a bad count is exit 1, not a
+    numpy crash (exit 4)."""
     if (
         isinstance(n_random_draws, bool)
         or not isinstance(n_random_draws, int)
@@ -134,6 +129,92 @@ class BacktestResult:
             "tool_version": self.tool_version,
             "total_true_loss": self.total_true_loss,
         }
+
+
+@dataclass(frozen=True)
+class Replay:
+    """Outcome of replaying a policy's published thresholds on one dataset.
+
+    `reviewed[i]` is True iff row `i` is routed to review. `thresholds` maps
+    every segment present in the data (first-appearance order) to the
+    threshold actually applied: the policy's `p_error_threshold`, or None
+    when the segment has a null threshold or is absent from the policy
+    (unseen at plan time) -- both mean "review nothing" (§9.4).
+    """
+
+    reviewed: np.ndarray
+    thresholds: dict[str, float | None]
+
+
+def replay_thresholds(
+    policy_segments: dict[str, Any], p_error: np.ndarray, segments: list[str]
+) -> Replay:
+    """THE replay rule (§9.4), shared by `backtest` and `compare` (§14):
+    review iff the row's segment has a non-null `p_error_threshold` in
+    `policy_segments` AND `p_error >= threshold`. Never capped: items tied
+    exactly at a threshold are all reviewed (tie inflation is expected)."""
+    reviewed = np.zeros(len(segments), dtype=bool)
+    thresholds: dict[str, float | None] = {}
+    for i, seg in enumerate(segments):
+        seg_stats = policy_segments.get(seg)
+        threshold = seg_stats.get("p_error_threshold") if isinstance(seg_stats, dict) else None
+        if seg not in thresholds:
+            thresholds[seg] = threshold
+        if threshold is not None and p_error[i] >= threshold:
+            reviewed[i] = True
+    return Replay(reviewed=reviewed, thresholds=thresholds)
+
+
+def policy_outcome(
+    replay: Replay,
+    segments: list[str],
+    true_loss: np.ndarray,
+    review_costs: np.ndarray,
+    total_true_loss: float,
+    *,
+    segment_review_spend: bool = False,
+) -> dict[str, Any]:
+    """Realized outcome of a replayed policy: backtest.json's
+    `strategies.policy` (§9.8), shared with `compare` (§14) so both report
+    the same numbers for the same review set and costs.
+
+    Accounting convention (module docstring, point 9): per-segment
+    captured/residual are independent `math.fsum`s; the strategy-level
+    `captured_loss` is the sequential sum of the per-segment values in
+    sorted-segment order, and `residual_loss = total_true_loss - captured_loss`.
+    `segment_review_spend=True` adds a per-segment `review_spend` (compare
+    needs it; backtest.json's schema does not carry it).
+    """
+    reviewed = replay.reviewed
+    n_rows = len(segments)
+    n_review = int(reviewed.sum())
+
+    seg_stats: dict[str, dict[str, Any]] = {}
+    for seg in sorted(set(segments)):
+        seg_indices = [i for i in range(n_rows) if segments[i] == seg]
+        seg_reviewed = [i for i in seg_indices if reviewed[i]]
+        seg_not_reviewed = [i for i in seg_indices if not reviewed[i]]
+        stats: dict[str, Any] = {
+            "captured_loss": math.fsum(float(true_loss[i]) for i in seg_reviewed),
+            "residual_loss": math.fsum(float(true_loss[i]) for i in seg_not_reviewed),
+            "n_review": len(seg_reviewed),
+            "n_total": len(seg_indices),
+            "p_error_threshold": replay.thresholds.get(seg),
+        }
+        if segment_review_spend:
+            stats["review_spend"] = math.fsum(float(review_costs[i]) for i in seg_reviewed)
+        seg_stats[seg] = stats
+
+    captured = sum(s["captured_loss"] for s in seg_stats.values())
+    return {
+        "captured_loss": captured,
+        "residual_loss": total_true_loss - captured,
+        "n_review": n_review,
+        "review_spend": math.fsum(float(review_costs[i]) for i in range(n_rows) if reviewed[i]),
+        "efficiency": captured / n_review if n_review > 0 else None,
+        "capture_rate": captured / total_true_loss if total_true_loss != 0 else None,
+        "segments": seg_stats,
+    }
 
 
 def run(
@@ -213,57 +294,12 @@ def run(
 
     p_error = np.asarray(calibrator.predict(scores), dtype=np.float64)
 
-    # 4. Policy strategy: threshold replay. Unseen segments (absent from
-    # policy_dict["segments"]) are never reviewed, same as a null threshold.
-    reviewed_policy = np.zeros(n_history, dtype=bool)
-    threshold_used: dict[str, float | None] = {}
-    for i, seg in enumerate(segments):
-        seg_stats = policy_segments.get(seg)
-        threshold = seg_stats.get("p_error_threshold") if isinstance(seg_stats, dict) else None
-        if seg not in threshold_used:
-            threshold_used[seg] = threshold
-        if threshold is not None and p_error[i] >= threshold:
-            reviewed_policy[i] = True
-
-    n_review = int(reviewed_policy.sum())
-
-    all_segments = sorted(set(segments))
-    policy_seg_stats: dict[str, dict[str, Any]] = {}
-    for seg in all_segments:
-        seg_indices = [i for i in range(n_history) if segments[i] == seg]
-        seg_reviewed = [i for i in seg_indices if reviewed_policy[i]]
-        seg_not_reviewed = [i for i in seg_indices if not reviewed_policy[i]]
-        captured = math.fsum(float(true_loss[i]) for i in seg_reviewed)
-        residual = math.fsum(float(true_loss[i]) for i in seg_not_reviewed)
-        policy_seg_stats[seg] = {
-            "captured_loss": captured,
-            "residual_loss": residual,
-            "n_review": len(seg_reviewed),
-            "n_total": len(seg_indices),
-            "p_error_threshold": threshold_used.get(seg),
-        }
-
-    # Strategy-level captured_loss is the sequential sum of per-segment values
-    # in sorted-segment order (tie-out convention); residual_loss is defined
-    # as total_true_loss - captured_loss (see module docstring, point 9).
-    policy_captured = sum(s["captured_loss"] for s in policy_seg_stats.values())
-    policy_residual = total_true_loss - policy_captured
-    policy_review_spend = math.fsum(
-        float(review_costs[i]) for i in range(n_history) if reviewed_policy[i]
-    )
-    policy_efficiency = policy_captured / n_review if n_review > 0 else None
-    policy_capture_rate = policy_captured / total_true_loss if total_true_loss != 0 else None
-
+    # 4. Policy strategy: threshold replay (shared with `compare`, §14, so the
+    # two commands can never disagree on which items a policy reviews).
+    replay = replay_thresholds(policy_segments, p_error, segments)
+    n_review = int(replay.reviewed.sum())
     strategies: dict[str, Any] = {
-        "policy": {
-            "captured_loss": policy_captured,
-            "residual_loss": policy_residual,
-            "n_review": n_review,
-            "review_spend": policy_review_spend,
-            "efficiency": policy_efficiency,
-            "capture_rate": policy_capture_rate,
-            "segments": policy_seg_stats,
-        }
+        "policy": policy_outcome(replay, segments, true_loss, review_costs, total_true_loss)
     }
 
     # 6. Raw-confidence baseline: rank by score ASC, tie-break item_id ASC

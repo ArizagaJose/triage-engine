@@ -18,6 +18,11 @@ from pydantic import (
 from triage.calibration import DEFAULT_ECE_GATE_MODE, EceGateMode
 from triage.exceptions import ContractViolation
 
+# Money-budget allocation (docs/interfaces.md §5): "prefix" stops at the first
+# item that does not fit; opt-in "fill" skips it and keeps going.
+BudgetStrategy = Literal["prefix", "fill"]
+DEFAULT_BUDGET_STRATEGY: BudgetStrategy = "prefix"
+
 
 class Budget(BaseModel):
     """Budget specification."""
@@ -26,13 +31,13 @@ class Budget(BaseModel):
 
     type: Literal["fraction", "count", "money"]
     value: float
+    strategy: BudgetStrategy = DEFAULT_BUDGET_STRATEGY
 
     @field_validator("value")
     @classmethod
     def value_positive(cls, v: float) -> float:
-        """Budget value must be positive and finite. `v <= 0` alone let NaN
-        through (every NaN comparison is False), which crashed the optimizer's
-        floor() with an internal error (exit 4) instead of exit 1."""
+        """Budget value must be positive and finite (`v <= 0` alone lets NaN
+        through: every NaN comparison is False)."""
         if not math.isfinite(v) or v <= 0:
             raise ValueError("budget.value must be > 0 and finite")
         return v
@@ -44,6 +49,26 @@ class Budget(BaseModel):
         if info.data.get("type") == "fraction" and v > 1.0:
             raise ValueError("budget.value must be <= 1.0 when type is 'fraction'")
         return v
+
+    @model_validator(mode="after")
+    def non_default_strategy_requires_money(self) -> "Budget":
+        """Fraction/count reviews all cost one unit, so "fill" would silently
+        change nothing there; reject it rather than pretend it is active."""
+        if self.strategy != DEFAULT_BUDGET_STRATEGY and self.type != "money":
+            raise ValueError(
+                f"budget.strategy={self.strategy!r} requires budget.type 'money', got {self.type!r}"
+            )
+        return self
+
+    @model_serializer(mode="wrap")
+    def _omit_default_strategy(self, handler: SerializerFunctionWrapHandler) -> Any:
+        """Omit the default strategy from dumps, so default-strategy
+        `config_snapshot`s (and their policy_hash) are unchanged; see
+        `Gates._omit_default_ece_gate_mode`."""
+        data = handler(self)
+        if isinstance(data, dict) and data.get("strategy") == DEFAULT_BUDGET_STRATEGY:
+            del data["strategy"]
+        return data
 
 
 class Gates(BaseModel):
@@ -114,8 +139,7 @@ class SegmentCosts(BaseModel):
     @field_validator("false_accept_cost", "review_cost")
     @classmethod
     def costs_nonnegative(cls, v: float) -> float:
-        """Costs must be finite and >= 0. NaN/inf costs used to pass and then
-        crash the artifact writer (JSON forbids NaN/inf) with exit 4."""
+        """Costs must be finite and >= 0 (the artifact JSON forbids NaN/inf)."""
         if not math.isfinite(v) or v < 0:
             raise ValueError("Costs must be >= 0 and finite")
         return v

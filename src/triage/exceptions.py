@@ -19,3 +19,9 @@ class CalibrationGateFailed(TriageError):
 
 class BudgetOverrunExceeded(TriageError):
     """Replayed review capacity above --max-budget-overrun. CLI exit code 5."""
+
+
+class CandidateRegression(TriageError):
+    """`compare --fail-on-regression`: the candidate policy is significantly
+    worse than the current one (bootstrap CI, docs/interfaces.md §14). CLI
+    exit code 6."""

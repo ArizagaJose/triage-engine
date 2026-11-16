@@ -768,6 +768,35 @@ class TestKpis:
         kpis = _build_summary(*build(budget=budget)).kpis
         assert kpis["reviewed"]["budget_label"] == label
 
+    @pytest.mark.parametrize(
+        "allocation,label",
+        [
+            (
+                {"selected_candidate": "net_benefit_per_cost"},
+                "budget 4,000 cost units (fill strategy, net-benefit-per-cost ranking)",
+            ),
+            (
+                {"selected_candidate": "net_benefit"},
+                "budget 4,000 cost units (fill strategy, net-benefit ranking)",
+            ),
+            (None, "budget 4,000 cost units (fill strategy)"),
+        ],
+    )
+    @pytest.mark.parametrize("with_backtest", [True, False])
+    def test_budget_label_names_fill_strategy_and_candidate(
+        self, allocation: dict[str, str] | None, label: str, with_backtest: bool
+    ) -> None:
+        """interfaces.md §11.7: a non-default money strategy is named, with the
+        selected candidate from policy.allocation when present."""
+        calibrator, policy, backtest = build(
+            budget={"type": "money", "value": 4000.0, "strategy": "fill"},
+            with_backtest=with_backtest,
+        )
+        if allocation is not None:
+            policy["allocation"] = allocation
+        kpis = _build_summary(calibrator, policy, backtest).kpis
+        assert kpis["reviewed"]["budget_label"] == label
+
 
 # ---------------------------------------------------------------------------
 # H.2 — property tests

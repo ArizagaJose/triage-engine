@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import polars as pl
 import pytest
 import yaml
 from rich.text import Text
@@ -25,19 +26,23 @@ from typer import rich_utils
 from tests.support import (
     GOLDEN_DIR,
     CliResult,
+    assert_queue_reconciles,
     files_under,
     gates_row_cells,
     html_without_created_at,
     load_json,
     ok,
+    read_queue_csv,
     without_created_at,
     write_costs,
+    write_money_costs,
 )
 from triage import cli as cli_module
 from triage import synth
 from triage.artifacts import content_hash, file_sha256
 from triage.cli import _run_cost_model
 from triage.exceptions import ContractViolation
+from triage.optimizer import REVIEW_QUEUE_COLUMNS, REVIEW_QUEUE_SCHEMA
 
 STAGES = ("synth", "calibrate", "plan", "backtest", "report")
 ARTIFACTS = ("calibrator.json", "policy.json", "backtest.json")
@@ -394,8 +399,21 @@ VALIDATION_CASES: list[ValidationCase] = [
             ("1.5", "must be <= 1.0"),
         )
     ),
+    # The synthetic cost model has a fraction budget: fill is refused there.
+    (
+        {"budget_strategy": "fill"},
+        "requires budget.type 'money'",
+        ("plan", {"budget_strategy": "fill"}, False),
+    ),
+    (
+        {"budget_strategy": "knapsack"},
+        "Input should be 'prefix' or 'fill'",
+        ("plan", {"budget_strategy": "knapsack"}, False),
+    ),
     # run-only rules
     ({"max_residual_risk": "-1"}, "must be >= 0", None),
+    ({"queue_format": "xml"}, "--queue-format must be one of csv, parquet; got 'xml'", None),
+    ({"queue_format": "CSV"}, "--queue-format must be one of csv, parquet; got 'CSV'", None),
     ({"scenario": "nope"}, "Unknown scenario 'nope'", ("synth", {"scenario": "nope"}, True)),
     ({"scenario": "drift", "costs": "x.yaml"}, "cannot be combined with --costs", None),
     ({"scenario": None, "golden": "g.parquet"}, "missing --batch, --costs", None),
@@ -629,7 +647,11 @@ RUN_STAGE_PARAMETERS: dict[str, dict[str, str]] = {
         "calibrator": "<run>/artifacts/calibrator.json",
         "costs": "<run>/costs.yaml (effective)",
         "budget": "None (applied to the effective costs.yaml)",
+        "budget_strategy": "None (applied to the effective costs.yaml)",
         "output": "<run>/artifacts/policy.json",
+        "queue_csv": "<run>/artifacts/review_queue.csv if csv in --queue-format, else None",
+        "queue_parquet": "<run>/artifacts/review_queue.parquet if parquet in --queue-format, "
+        "else None",
     },
     "backtest": {
         "policy": "<run>/artifacts/policy.json",
@@ -640,7 +662,11 @@ RUN_STAGE_PARAMETERS: dict[str, dict[str, str]] = {
         "output": "<run>/artifacts/backtest.json",
         "max_budget_overrun": "run:max_budget_overrun",
     },
-    "report": {"from_dir": "<run>/artifacts", "output": "<run>/report.html"},
+    "report": {
+        "from_dir": "<run>/artifacts",
+        "compare_dir": "None (run renders the single-policy report)",
+        "output": "<run>/report.html",
+    },
 }
 
 
@@ -691,7 +717,13 @@ _COSTS = synth.emitted_costs_yaml()
 
 def test_cost_model_no_overrides_returns_no_text() -> None:
     model, text = _run_cost_model(
-        _COSTS, "src", budget=None, max_ece=None, ece_gate_mode=None, max_residual_risk=None
+        _COSTS,
+        "src",
+        budget=None,
+        budget_strategy=None,
+        max_ece=None,
+        ece_gate_mode=None,
+        max_residual_risk=None,
     )
     assert text is None
     assert model.gates.max_ece == 0.05 and model.gates.ece_gate_mode == "point"
@@ -699,7 +731,13 @@ def test_cost_model_no_overrides_returns_no_text() -> None:
 
 def test_cost_model_overrides_patch_only_their_fields() -> None:
     model, text = _run_cost_model(
-        _COSTS, "src", budget=0.2, max_ece=0.07, ece_gate_mode="ci_upper", max_residual_risk=10.0
+        _COSTS,
+        "src",
+        budget=0.2,
+        budget_strategy=None,
+        max_ece=0.07,
+        ece_gate_mode="ci_upper",
+        max_residual_risk=10.0,
     )
     assert text is not None
     patched = yaml.safe_load(text)
@@ -716,7 +754,13 @@ def test_cost_model_overrides_patch_only_their_fields() -> None:
 
 def test_cost_model_explicit_point_keeps_default_semantics() -> None:
     model, text = _run_cost_model(
-        _COSTS, "src", budget=None, max_ece=None, ece_gate_mode="point", max_residual_risk=None
+        _COSTS,
+        "src",
+        budget=None,
+        budget_strategy=None,
+        max_ece=None,
+        ece_gate_mode="point",
+        max_residual_risk=None,
     )
     assert text is not None
     assert model.gates.ece_gate_mode == "point"
@@ -728,7 +772,13 @@ def test_cost_model_overrides_on_missing_or_null_gates(gates_yaml: str) -> None:
     source = "budget:\n  type: count\n  value: 5\n" + gates_yaml
     source += "segments:\n  default:\n    false_accept_cost: 1.0\n    review_cost: 1.0\n"
     model, _ = _run_cost_model(
-        source, "src", budget=None, max_ece=0.1, ece_gate_mode=None, max_residual_risk=None
+        source,
+        "src",
+        budget=None,
+        budget_strategy=None,
+        max_ece=0.1,
+        ece_gate_mode=None,
+        max_residual_risk=None,
     )
     assert model.gates.max_ece == 0.1
 
@@ -736,9 +786,291 @@ def test_cost_model_overrides_on_missing_or_null_gates(gates_yaml: str) -> None:
 def test_cost_model_invalid_override_names_flags_and_source() -> None:
     with pytest.raises(ContractViolation) as exc_info:
         _run_cost_model(
-            _COSTS, "my.yaml", budget=None, max_ece=None, ece_gate_mode="x", max_residual_risk=None
+            _COSTS,
+            "my.yaml",
+            budget=None,
+            budget_strategy=None,
+            max_ece=None,
+            ece_gate_mode="x",
+            max_residual_risk=None,
         )
     message = str(exc_info.value)
     assert "--ece-gate-mode='x'" in message
     assert "my.yaml" in message
     assert "gates.ece_gate_mode" in message
+
+
+# --- 6. Review queue export (--queue-format) ----------------------------------------
+
+QUEUE_FILES = {
+    "artifacts/review_queue.csv",
+    "artifacts/review_queue.parquet",
+    "artifacts/review_queue.json",
+}
+
+
+def _run_with_queue(cli: Any, out: Path, formats: list[str], *extra: str) -> CliResult:
+    """`args()` cannot repeat a flag; --queue-format is repeatable."""
+    argv = ["run", "-o", str(out), *extra]
+    for fmt in formats:
+        argv += ["--queue-format", fmt]
+    return cli.argv(argv)
+
+
+@pytest.fixture(scope="module")
+def queue_run(cli: Any, tmp_path_factory: Any) -> Path:
+    out = tmp_path_factory.mktemp("queue_run") / "run"
+    ok(_run_with_queue(cli, out, ["csv", "parquet"], "--scenario", "overconfident", "--seed", "42"))
+    return out
+
+
+def test_queue_run_layout(queue_run: Path) -> None:
+    assert files_under(queue_run) == SYNTH_FILES | QUEUE_FILES
+
+
+def test_queue_run_other_artifacts_identical_to_no_export(queue_run: Path, chain: Any) -> None:
+    """Export is a view: calibrator, policy and backtest are the documented
+    chain's artifacts, policy_hash included."""
+    for name in ARTIFACTS:
+        assert without_created_at(load_json(queue_run / "artifacts" / name)) == (
+            without_created_at(chain("overconfident").load(name.removesuffix(".json")))
+        ), name
+
+
+def test_queue_run_equals_manual_plan_export(
+    queue_run: Path, cli: Any, chain: Any, tmp_path: Path
+) -> None:
+    base = chain("overconfident")
+    ok(
+        cli(
+            "plan",
+            batch=base.batch,
+            calibrator=base.calibrator,
+            costs=base.costs,
+            o=tmp_path / "policy.json",
+            queue_csv=tmp_path / "review_queue.csv",
+            queue_parquet=tmp_path / "review_queue.parquet",
+        )
+    )
+    art = queue_run / "artifacts"
+    for name in ("review_queue.csv", "review_queue.parquet"):
+        assert (art / name).read_bytes() == (tmp_path / name).read_bytes(), name
+    assert without_created_at(load_json(art / "review_queue.json")) == without_created_at(
+        load_json(tmp_path / "review_queue.json")
+    )
+
+
+def test_queue_run_reconciles_with_its_policy(queue_run: Path) -> None:
+    art = queue_run / "artifacts"
+    policy = load_json(art / "policy.json")
+    from_csv = read_queue_csv(art / "review_queue.csv")
+    assert from_csv.equals(pl.read_parquet(art / "review_queue.parquet"))
+    assert_queue_reconciles(from_csv, policy)
+    manifest = load_json(art / "review_queue.json")
+    assert manifest["policy_hash"] == policy["policy_hash"]
+    assert manifest["gates"] == {"status": "pass", "failed": []}
+    # The run's batch is the synth output: the trace points at real bytes.
+    assert set(from_csv["batch_sha256"].to_list()) == {
+        file_sha256(queue_run / "data" / "batch.parquet")
+    }
+
+
+def test_queue_run_progress_and_summary(queue_run: Path, cli: Any, tmp_path: Path) -> None:
+    result = ok(_run_with_queue(cli, tmp_path / "r", ["csv"], "--scenario", "drift"))
+    assert "run: synth=ok calibrate=ok plan=ok backtest=ok report=ok" in result.stdout
+    assert f"queue=1000 rows -> {tmp_path / 'r' / 'artifacts' / 'review_queue.json'}" in (
+        result.stdout
+    )
+
+
+def test_queue_format_repeats_are_harmless(cli: Any, tmp_path: Path) -> None:
+    out = tmp_path / "run"
+    ok(_run_with_queue(cli, out, ["parquet", "parquet"], "--scenario", "well_calibrated"))
+    assert files_under(out) == SYNTH_FILES | (QUEUE_FILES - {"artifacts/review_queue.csv"})
+    assert set(load_json(out / "artifacts" / "review_queue.json")["files"]) == {"parquet"}
+
+
+def test_queue_stale_files_are_removed(cli: Any, tmp_path: Path) -> None:
+    """Queue files are owned by `run`: a rerun never leaves a queue next to a
+    policy it does not belong to -- neither without export nor with a
+    different format set."""
+    out = tmp_path / "run"
+    ok(_run_with_queue(cli, out, ["csv", "parquet"], "--scenario", "overconfident"))
+    ok(_run_with_queue(cli, out, ["csv"], "--scenario", "overconfident", "--budget", "0.05"))
+    assert not (out / "artifacts" / "review_queue.parquet").exists()
+    manifest = load_json(out / "artifacts" / "review_queue.json")
+    assert set(manifest["files"]) == {"csv"}
+    assert manifest["n_rows"] == 500
+    ok(cli("run", scenario="overconfident", o=out))
+    assert files_under(out) == SYNTH_FILES
+
+
+def test_queue_invalid_format_does_not_touch_previous_run(cli: Any, tmp_path: Path) -> None:
+    out = tmp_path / "run"
+    ok(_run_with_queue(cli, out, ["csv"], "--scenario", "overconfident"))
+    before = {name: (out / name).read_bytes() for name in files_under(out)}
+    result = _run_with_queue(cli, out, ["csv", "json"], "--scenario", "overconfident")
+    assert result.returncode == 1
+    assert "got 'json'" in result.stderr
+    assert {name: (out / name).read_bytes() for name in files_under(out)} == before
+
+
+def test_queue_path_that_is_a_directory_is_rejected(cli: Any, tmp_path: Path) -> None:
+    out = tmp_path / "run"
+    (out / "artifacts" / "review_queue.json").mkdir(parents=True)
+    result = _run_with_queue(cli, out, ["csv"], "--scenario", "overconfident")
+    assert result.returncode == 1
+    assert "review_queue.json exists and is not a file" in result.stderr
+
+
+def test_queue_input_that_run_would_overwrite_is_rejected(
+    cli: Any, own_inputs: Path, tmp_path: Path
+) -> None:
+    """Queue paths are owned even without --queue-format: an input stored
+    there would be deleted by the stale-output cleanup."""
+    out = tmp_path / "run"
+    (out / "artifacts").mkdir(parents=True)
+    batch_there = out / "artifacts" / "review_queue.parquet"
+    shutil.copy(own_inputs / "batch.parquet", batch_there)
+    result = cli("run", **{**_own(own_inputs), "batch": batch_there}, o=out)
+    assert result.returncode == 1
+    assert "is a file `run` writes" in result.stderr
+    assert batch_there.read_bytes() == (own_inputs / "batch.parquet").read_bytes()
+
+
+def test_queue_own_data_mode(cli: Any, own_inputs: Path, chain: Any, tmp_path: Path) -> None:
+    out = tmp_path / "run"
+    argv = ["run", "-o", str(out), "--queue-format", "csv"]
+    for key, path in _own(own_inputs).items():
+        argv += [f"--{key}", str(path)]
+    result = ok(cli.argv(argv))
+    assert "run: calibrate=ok plan=ok report=ok" in result.stdout
+    assert files_under(out) == {
+        "costs.yaml",
+        "report.html",
+        "artifacts/calibrator.json",
+        "artifacts/policy.json",
+        "artifacts/review_queue.csv",
+        "artifacts/review_queue.json",
+    }
+    policy = load_json(out / "artifacts" / "policy.json")
+    assert without_created_at(policy) == without_created_at(chain("overconfident").load("policy"))
+    queue = read_queue_csv(out / "artifacts" / "review_queue.csv")
+    assert_queue_reconciles(queue, policy)
+    assert set(queue["batch_sha256"].to_list()) == {file_sha256(own_inputs / "batch.parquet")}
+
+
+def test_queue_gate_failure_keep_going_records_it(cli: Any, tmp_path: Path) -> None:
+    out = tmp_path / "run"
+    result = _run_with_queue(
+        cli, out, ["csv"], "--scenario", "overconfident", "--ece-gate-mode", "ci_upper"
+    )
+    assert result.returncode == 3
+    assert _run_statuses(result.stdout)["plan"] == 3
+    assert files_under(out) == SYNTH_FILES | (QUEUE_FILES - {"artifacts/review_queue.parquet"})
+    manifest = load_json(out / "artifacts" / "review_queue.json")
+    assert manifest["gates"] == {"status": "failed", "failed": ["max_ece"]}
+    assert_queue_reconciles(
+        read_queue_csv(out / "artifacts" / "review_queue.csv"),
+        load_json(out / "artifacts" / "policy.json"),
+    )
+
+
+def test_queue_gate_failure_fail_fast_never_reaches_plan(cli: Any, tmp_path: Path) -> None:
+    out = tmp_path / "run"
+    result = _run_with_queue(
+        cli,
+        out,
+        ["csv", "parquet"],
+        "--scenario",
+        "overconfident",
+        "--ece-gate-mode",
+        "ci_upper",
+        "--fail-fast",
+    )
+    assert result.returncode == 3
+    assert not files_under(out) & QUEUE_FILES
+
+
+def test_queue_empty_selection_via_budget_override(cli: Any, tmp_path: Path) -> None:
+    out = tmp_path / "run"
+    ok(
+        _run_with_queue(
+            cli, out, ["csv", "parquet"], "--scenario", "overconfident", "--budget", "0.00001"
+        )
+    )
+    art = out / "artifacts"
+    manifest = load_json(art / "review_queue.json")
+    policy = load_json(art / "policy.json")
+    assert manifest["n_rows"] == 0 == policy["totals"]["n_review"]
+    assert manifest["policy_hash"] == policy["policy_hash"]  # traceable with zero rows
+    assert (art / "review_queue.csv").read_text().splitlines() == [",".join(REVIEW_QUEUE_COLUMNS)]
+    assert pl.read_parquet(art / "review_queue.parquet").schema == REVIEW_QUEUE_SCHEMA
+
+
+@pytest.mark.parametrize("force_terminal", [False, True])
+def test_run_help_lists_queue_format(
+    cli: Any, monkeypatch: pytest.MonkeyPatch, force_terminal: bool
+) -> None:
+    monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", force_terminal)
+    assert "--queue-format" in Text.from_ansi(ok(cli.argv(["run", "--help"])).stdout).plain
+
+
+def test_cost_model_budget_strategy_override_patches_budget() -> None:
+    source = _COSTS.replace("type: fraction\n  value: 0.10", "type: money\n  value: 1000.0")
+    model, text = _run_cost_model(
+        source,
+        "src",
+        budget=None,
+        budget_strategy="fill",
+        max_ece=None,
+        ece_gate_mode=None,
+        max_residual_risk=None,
+    )
+    assert text is not None
+    assert yaml.safe_load(text)["budget"] == {"type": "money", "value": 1000.0, "strategy": "fill"}
+    assert model.budget.strategy == "fill"
+
+
+def test_cost_model_invalid_budget_strategy_names_flag_and_source() -> None:
+    with pytest.raises(ContractViolation) as exc_info:
+        _run_cost_model(
+            _COSTS,
+            "my.yaml",
+            budget=None,
+            budget_strategy="fill",
+            max_ece=None,
+            ece_gate_mode=None,
+            max_residual_risk=None,
+        )
+    message = str(exc_info.value)
+    assert "--budget-strategy='fill'" in message
+    assert "my.yaml" in message
+    assert "requires budget.type 'money'" in message
+
+
+def test_own_data_fill_run_equals_the_manual_chain(
+    cli: Any, own_inputs: Path, tmp_path: Path
+) -> None:
+    """run --budget-strategy fill writes the strategy into the effective
+    costs.yaml; the manual chain replaying that file yields the same artifacts."""
+    money = write_money_costs(own_inputs / "costs.yaml", tmp_path / "money.yaml")
+    out = tmp_path / "run"
+    options = {**_own(own_inputs, history=True), "costs": money}
+    ok(cli("run", **options, budget_strategy="fill", o=out))
+    assert yaml.safe_load((out / "costs.yaml").read_text())["budget"]["strategy"] == "fill"
+    run_policy = load_json(out / "artifacts" / "policy.json")
+    assert run_policy["allocation"] == {"selected_candidate": "net_benefit_per_cost"}
+
+    manual = tmp_path / "manual"
+    ok(cli("calibrate", golden=options["golden"], seed=42, o=manual / "calibrator.json"))
+    ok(
+        cli(
+            "plan",
+            batch=options["batch"],
+            calibrator=manual / "calibrator.json",
+            costs=out / "costs.yaml",
+            o=manual / "policy.json",
+        )
+    )
+    assert without_created_at(load_json(manual / "policy.json")) == without_created_at(run_policy)

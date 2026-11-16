@@ -18,14 +18,18 @@ from typer._click.exceptions import ClickException
 
 from triage import __version__, artifacts, calibration, contract, optimizer
 from triage import backtest as backtest_module
+from triage import compare as compare_module
+from triage import compare_report as compare_report_module
 from triage import costs as costs_module
 from triage import report as report_module
+from triage import review_queue as review_queue_module
 from triage import synth as synth_module
 from triage.calibration import DEFAULT_ECE_GATE_MODE, Calibrator
 from triage.costs import Budget, CostModel, Gates
 from triage.exceptions import (
     BudgetOverrunExceeded,
     CalibrationGateFailed,
+    CandidateRegression,
     ContractViolation,
     ResidualRiskExceeded,
 )
@@ -57,9 +61,9 @@ def synth(
 # called before it reads or writes anything. `run` calls the same preflights
 # with the exact arguments it later passes to each stage, so `run` and the
 # individual commands cannot accept or reject different inputs
-# (tests/cli/test_run.py holds the parity tests). `plan`'s only option,
-# --budget, needs the YAML's budget.type and is validated by costs.Budget in
-# both paths.
+# (tests/cli/test_run.py holds the parity tests). `plan`'s --budget needs the
+# YAML's budget.type and is validated by costs.Budget in both paths; its
+# review-queue options go through `_plan_preflight`.
 
 
 def _synth_preflight(scenario: str, seed: int) -> None:
@@ -86,6 +90,126 @@ def _backtest_preflight(seed: int, n_random_draws: int, max_budget_overrun: floa
     backtest_module.validate_n_random_draws(n_random_draws)
     if max_budget_overrun is not None:
         backtest_module.validate_max_budget_overrun(max_budget_overrun)
+
+
+def _queue_manifest_path(queue_csv: Path | None, queue_parquet: Path | None) -> Path | None:
+    """Where `plan` writes review_queue.json: next to the queue export(s).
+
+    None when no export was requested. The manifest records file NAMES only,
+    so it must sit in the same directory as the files it describes;
+    `_plan_preflight` enforces that both exports share that directory.
+    """
+    first = queue_csv if queue_csv is not None else queue_parquet
+    if first is None:
+        return None
+    return first.parent / review_queue_module.MANIFEST_NAME
+
+
+def _plan_preflight(
+    *,
+    batch: Path,
+    calibrator: Path,
+    costs: Path,
+    output: Path,
+    queue_csv: Path | None,
+    queue_parquet: Path | None,
+) -> None:
+    """Validate plan's review-queue options before anything is read or written.
+
+    --budget is not checked here: it needs the YAML's budget.type and is
+    validated by costs.Budget once the cost model is loaded (same rule in
+    `plan` and `run`).
+    """
+    for flag, path, suffix in (
+        ("--queue-csv", queue_csv, ".csv"),
+        ("--queue-parquet", queue_parquet, ".parquet"),
+    ):
+        if path is not None and path.suffix.lower() != suffix:
+            raise ContractViolation(f"{flag} {path} must end in {suffix}")
+    if (
+        queue_csv is not None
+        and queue_parquet is not None
+        and queue_csv.resolve().parent != queue_parquet.resolve().parent
+    ):
+        raise ContractViolation(
+            f"--queue-csv {queue_csv} and --queue-parquet {queue_parquet} must be in the same "
+            f"directory: {review_queue_module.MANIFEST_NAME} is written next to them and "
+            "records their file names"
+        )
+    manifest = _queue_manifest_path(queue_csv, queue_parquet)
+    if manifest is None:
+        return
+    written = {
+        "--queue-csv": queue_csv,
+        "--queue-parquet": queue_parquet,
+        f"the queue manifest ({review_queue_module.MANIFEST_NAME})": manifest,
+    }
+    protected = {"--batch": batch, "--calibrator": calibrator, "--costs": costs, "--output": output}
+    for what, path in written.items():
+        if path is None:
+            continue
+        for flag, other in protected.items():
+            if path.resolve() == other.resolve():
+                raise ContractViolation(
+                    f"{what} {path} would overwrite {flag} {other}; pick another path"
+                )
+        if path.exists() and not path.is_file():
+            raise ContractViolation(f"{what} {path} exists and is not a file")
+
+
+def _evaluate_plan_gates(
+    cal: Calibrator, policy: optimizer.Policy, cost_model: CostModel
+) -> list[tuple[str, CalibrationGateFailed | ResidualRiskExceeded]]:
+    """Run plan's gates in their pinned order (max_ece, then max_residual_risk)
+    WITHOUT stopping at the first failure, and return every failure as
+    (gate name, the exception the check raised).
+
+    The checks themselves are the real `check_ece_gate` / `check_residual_gate`
+    (single source of gate semantics); only their gate exceptions are caught.
+    Anything else -- e.g. a ContractViolation for an unknown ECE mode --
+    propagates immediately, as before. The caller records the outcome in the
+    review-queue manifest and then raises the FIRST failure, so exit codes
+    and messages are exactly those of the short-circuiting chain.
+    """
+    failures: list[tuple[str, CalibrationGateFailed | ResidualRiskExceeded]] = []
+    if cost_model.gates.max_ece is not None:
+        try:
+            calibration.check_ece_gate(
+                cal, cost_model.gates.max_ece, cost_model.gates.ece_gate_mode
+            )
+        except CalibrationGateFailed as e:
+            failures.append(("max_ece", e))
+    try:
+        optimizer.check_residual_gate(policy, cost_model)
+    except ResidualRiskExceeded as e:
+        failures.append(("max_residual_risk", e))
+    return failures
+
+
+def _compare_preflight(
+    seed: int, n_bootstrap: int, ci_level: float, fail_on_regression: bool
+) -> None:
+    compare_module.validate_uncertainty_options(seed, n_bootstrap, ci_level)
+    if fail_on_regression and n_bootstrap == 0:
+        raise ContractViolation(
+            "--fail-on-regression gates on the bootstrap CI, which needs --n-bootstrap > 0"
+        )
+
+
+def _read_json_artifact(path: Path, label: str) -> dict[str, Any]:
+    """Read one JSON artifact: unreadable, invalid JSON, or not an object is a
+    contract violation (exit 1) naming the file."""
+    try:
+        text = path.read_text()
+    except OSError as e:
+        raise ContractViolation(f"Cannot read {label} file {path}: {e}") from e
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ContractViolation(f"{label.capitalize()} file {path} is not valid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise ContractViolation(f"{label.capitalize()} file {path} must contain a JSON object")
+    return data
 
 
 @app.command()
@@ -139,14 +263,41 @@ def plan(
     calibrator: Path = typer.Option(..., help="Path to calibrator.json"),
     costs: Path = typer.Option(..., help="Path to costs.yaml"),
     budget: float | None = typer.Option(None, help="Override budget.value from YAML"),
+    budget_strategy: str | None = typer.Option(
+        None,
+        "--budget-strategy",
+        help="Override budget.strategy from YAML: 'prefix' (default; stop at the first item "
+        "that does not fit) or 'fill' (money budgets only; skip items that do not fit and "
+        "keep the better of two rankings by total expected net benefit).",
+    ),
     output: Path = typer.Option(
         ...,
         "--output",
         "-o",
         help="Output path for policy.json",
     ),
+    queue_csv: Path | None = typer.Option(
+        None,
+        "--queue-csv",
+        help="Also export the review queue (the optimizer's exact selection, in priority "
+        "order) as CSV. review_queue.json is written next to it.",
+    ),
+    queue_parquet: Path | None = typer.Option(
+        None,
+        "--queue-parquet",
+        help="Also export the review queue as Parquet (same directory as --queue-csv if both "
+        "are given). review_queue.json is written next to it.",
+    ),
 ) -> None:
     """Plan routing policy given calibrator and costs."""
+    _plan_preflight(
+        batch=batch,
+        calibrator=calibrator,
+        costs=costs,
+        output=output,
+        queue_csv=queue_csv,
+        queue_parquet=queue_parquet,
+    )
     batch_df = contract.read_input(batch)
 
     try:
@@ -164,11 +315,28 @@ def plan(
 
     cost_model = costs_module.load(costs)
 
-    if budget is not None:
+    if budget is not None or budget_strategy is not None:
+        # Revalidate the whole Budget (type/value/strategy rules interact);
+        # a field that is not overridden keeps its YAML value.
+        overridden = []
+        if budget is not None:
+            overridden.append(f"--budget override {budget!r}")
+        if budget_strategy is not None:
+            overridden.append(f"--budget-strategy override {budget_strategy!r}")
         try:
-            new_budget = Budget(type=cost_model.budget.type, value=budget)
+            new_budget = Budget.model_validate(
+                {
+                    "type": cost_model.budget.type,
+                    "value": budget if budget is not None else cost_model.budget.value,
+                    "strategy": (
+                        budget_strategy
+                        if budget_strategy is not None
+                        else cost_model.budget.strategy
+                    ),
+                }
+            )
         except ValidationError as e:
-            raise ContractViolation(f"Invalid --budget override {budget!r}: {e}") from e
+            raise ContractViolation(f"Invalid {' and '.join(overridden)}: {e}") from e
         cost_model = cost_model.model_copy(update={"budget": new_budget})
 
     input_sha256s = {
@@ -179,24 +347,65 @@ def plan(
         "calibrator": artifacts.content_hash(calibrator_dict),
         "costs": artifacts.file_sha256(costs),
     }
-    policy = optimizer.plan(
+    # One allocation, two views: the policy and the review queue behind it. The
+    # policy is identical to optimizer.plan()'s, so policy.json (and its
+    # policy_hash) does not depend on whether a queue export was requested.
+    result = optimizer.plan_with_queue(
         batch_df, cal, cost_model, input_sha256s=input_sha256s, tool_version=__version__
     )
+    policy = result.policy
 
+    created_at = artifacts.utc_now_iso()
     artifact_dict = policy.to_dict()
-    artifact_dict["created_at"] = artifacts.utc_now_iso()
+    artifact_dict["created_at"] = created_at
     artifacts.write_artifact(artifact_dict, output)
 
-    if cost_model.gates.max_ece is not None:
-        calibration.check_ece_gate(cal, cost_model.gates.max_ece, cost_model.gates.ece_gate_mode)
-    optimizer.check_residual_gate(policy, cost_model)
+    # Gates are evaluated before the queue is written so its manifest records
+    # the outcome; they are RAISED only after every artifact is on disk
+    # (artifact-first, same exit code and message as the first failing check).
+    gate_failures = _evaluate_plan_gates(cal, policy, cost_model)
+
+    queue_summary = ""
+    manifest_path = _queue_manifest_path(queue_csv, queue_parquet)
+    if manifest_path is not None:
+        gate_status = (
+            review_queue_module.GateStatus(
+                status="failed", failed=tuple(name for name, _ in gate_failures)
+            )
+            if gate_failures
+            else review_queue_module.GATE_STATUS_PASS
+        )
+        manifest = review_queue_module.export(
+            result.review_queue,
+            csv_path=queue_csv,
+            parquet_path=queue_parquet,
+            manifest_path=manifest_path,
+            policy_hash=policy.policy_hash,
+            input_sha256s=policy.input_sha256s,
+            totals=policy.totals,
+            gate_status=gate_status,
+            tool_version=__version__,
+            created_at=created_at,
+        )
+        queue_summary = f" queue={manifest['n_rows']} rows -> {manifest_path}"
+
+    if gate_failures:
+        raise gate_failures[0][1]
 
     totals = policy.totals
+    # Only opt-in strategies add to the line; the default summary is unchanged.
+    strategy_summary = ""
+    if policy.allocation is not None:
+        strategy_summary = (
+            f"budget_strategy={cost_model.budget.strategy} "
+            f"selected_candidate={policy.allocation['selected_candidate']} "
+        )
     typer.echo(
         f"n_review={totals['n_review']}/{totals['n_total']} "
         f"captured={totals['expected_captured_loss']:.1f} "
         f"residual={totals['expected_residual_loss']:.1f} "
-        f"policy_hash={policy.policy_hash[:12]} -> {output}"
+        f"{strategy_summary}"
+        f"policy_hash={policy.policy_hash[:12]} -> {output}{queue_summary}"
     )
 
 
@@ -293,21 +502,133 @@ def backtest(
     )
 
 
+COMPARISON_FILENAME = "comparison.json"
+
+
 @app.command()
-def report(
-    from_dir: Path = typer.Option(
-        ...,
-        "--from",
-        help="Directory containing calibrator.json and policy.json (backtest.json optional)",
+def compare(
+    current_policy: Path = typer.Option(..., help="Path to the CURRENT policy.json"),
+    current_calibrator: Path = typer.Option(
+        ..., help="Path to the calibrator.json the current policy was planned with"
+    ),
+    candidate_policy: Path = typer.Option(..., help="Path to the CANDIDATE policy.json"),
+    candidate_calibrator: Path = typer.Option(
+        ..., help="Path to the calibrator.json the candidate policy was planned with"
+    ),
+    history: Path = typer.Option(..., help="Path to labeled history (parquet or CSV)"),
+    eval_costs: Path | None = typer.Option(
+        None,
+        help="Explicit evaluation cost model (costs.yaml) that prices BOTH policies. Required "
+        "when their own costs differ on a history segment. Its budget and gates are ignored.",
+    ),
+    seed: int = typer.Option(42, help="Seed for the paired bootstrap CI"),
+    n_bootstrap: int = typer.Option(
+        compare_module.DEFAULT_N_BOOTSTRAP,
+        help="Paired bootstrap resamples for the CI of each delta (0 = no CI)",
+    ),
+    ci_level: float = typer.Option(
+        compare_module.DEFAULT_CI_LEVEL, help="Bootstrap CI level, in (0, 1)"
+    ),
+    fail_on_regression: bool = typer.Option(
+        False,
+        "--fail-on-regression",
+        help="Exit 6 if the candidate is significantly worse (bootstrap CI): higher total "
+        "cost, or worse on captured loss/reviews/spend and better on none. "
+        f"{COMPARISON_FILENAME} is written first.",
     ),
     output: Path = typer.Option(
         ...,
         "--output",
         "-o",
-        help="Output path for report.html",
+        help=f"Output directory; receives {COMPARISON_FILENAME}",
     ),
 ) -> None:
-    """Render a self-contained HTML report from artifacts in a directory."""
+    """Compare a current and a candidate policy on the same labeled history."""
+    _compare_preflight(seed, n_bootstrap, ci_level, fail_on_regression)
+    if output.exists() and not output.is_dir():
+        raise ContractViolation(f"--output {output} exists and is not a directory")
+
+    loaded = {
+        "current_policy": _read_json_artifact(current_policy, "current policy"),
+        "current_calibrator": _read_json_artifact(current_calibrator, "current calibrator"),
+        "candidate_policy": _read_json_artifact(candidate_policy, "candidate policy"),
+        "candidate_calibrator": _read_json_artifact(candidate_calibrator, "candidate calibrator"),
+    }
+    history_df = contract.read_input(history, require_truth=True)
+    eval_cost_model = costs_module.load(eval_costs) if eval_costs is not None else None
+
+    result = compare_module.run(
+        **loaded,
+        history=history_df,
+        history_sha256=artifacts.file_sha256(history),
+        eval_costs=eval_cost_model,
+        eval_costs_sha256=artifacts.file_sha256(eval_costs) if eval_costs is not None else None,
+        seed=seed,
+        n_bootstrap=n_bootstrap,
+        ci_level=ci_level,
+        tool_version=__version__,
+    )
+
+    out_path = output / COMPARISON_FILENAME
+    artifact_dict = result.to_dict()
+    artifact_dict["created_at"] = artifacts.utc_now_iso()
+    artifacts.write_artifact(artifact_dict, out_path)
+
+    if fail_on_regression:
+        compare_module.check_regression_gate(result)
+
+    d = result.delta
+    ci_verdict = result.verdict["ci"]
+    ci_part = f" (ci: {ci_verdict['label']})" if ci_verdict is not None else ""
+    typer.echo(
+        f"verdict={result.verdict['label']}{ci_part} "
+        f"d_captured={d['captured_loss']:+.1f} d_reviews={d['n_review']:+d} "
+        f"d_spend={d['review_spend']:+.1f} d_total_cost={d['total_cost']:+.1f} "
+        f"basis={result.basis['source']} comparison_hash={result.comparison_hash[:12]} "
+        f"-> {out_path}"
+    )
+
+
+@app.command()
+def report(
+    from_dir: Path | None = typer.Option(
+        None,
+        "--from",
+        help="Single-policy report: directory containing calibrator.json and policy.json "
+        "(backtest.json optional)",
+    ),
+    compare_dir: Path | None = typer.Option(
+        None,
+        "--compare",
+        help=f"Comparison report: directory containing {COMPARISON_FILENAME} "
+        "(written by `triage compare`)",
+    ),
+    output: Path = typer.Option(
+        ...,
+        "--output",
+        "-o",
+        help="Output path for the HTML report",
+    ),
+) -> None:
+    """Render a self-contained HTML report: one policy's chain (--from) or a
+    policy comparison (--compare)."""
+    if (from_dir is None) == (compare_dir is None):
+        raise ContractViolation(
+            "report needs exactly one of --from DIR (single-policy report: calibrator.json, "
+            f"policy.json, optional backtest.json) or --compare DIR ({COMPARISON_FILENAME})"
+        )
+    if compare_dir is not None:
+        comparison_path = compare_dir / COMPARISON_FILENAME
+        comparison_dict = _read_json_artifact(comparison_path, "comparison")
+        html = compare_report_module.render(
+            comparison_dict, created_at=artifacts.utc_now_iso(), tool_version=__version__
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(html)
+        typer.echo(f"included=comparison -> {output}")
+        return
+
+    assert from_dir is not None
     calibrator_path = from_dir / "calibrator.json"
     policy_path = from_dir / "policy.json"
     backtest_path = from_dir / "backtest.json"
@@ -383,6 +704,12 @@ class _RunLayout:
     policy: Path
     backtest: Path
     report: Path
+    # Review-queue exports (--queue-format). Owned even when not requested, so a
+    # run without export removes a previous run's queue instead of leaving it
+    # next to a policy it no longer matches.
+    queue_csv: Path
+    queue_parquet: Path
+    queue_manifest: Path
 
     @classmethod
     def for_output(cls, out: Path, *, synthetic: bool) -> "_RunLayout":
@@ -395,6 +722,9 @@ class _RunLayout:
             policy=artifacts_dir / "policy.json",
             backtest=artifacts_dir / "backtest.json",
             report=out / "report.html",
+            queue_csv=artifacts_dir / "review_queue.csv",
+            queue_parquet=artifacts_dir / "review_queue.parquet",
+            queue_manifest=artifacts_dir / review_queue_module.MANIFEST_NAME,
         )
 
     @property
@@ -403,6 +733,7 @@ class _RunLayout:
 
     def owned_files(self) -> list[Path]:
         files = [self.costs, self.calibrator, self.policy, self.backtest, self.report]
+        files += [self.queue_csv, self.queue_parquet, self.queue_manifest]
         if self.data_dir is not None:
             files += [
                 self.data_dir / name
@@ -416,6 +747,7 @@ def _run_cost_model(
     source_label: str,
     *,
     budget: float | None,
+    budget_strategy: str | None,
     max_ece: float | None,
     ece_gate_mode: str | None,
     max_residual_risk: float | None,
@@ -430,6 +762,8 @@ def _run_cost_model(
     overrides: dict[str, Any] = {}
     if budget is not None:
         overrides["--budget"] = budget
+    if budget_strategy is not None:
+        overrides["--budget-strategy"] = budget_strategy
     if max_ece is not None:
         overrides["--max-ece"] = max_ece
     if ece_gate_mode is not None:
@@ -443,6 +777,8 @@ def _run_cost_model(
 
     if budget is not None:
         raw["budget"] = {**raw["budget"], "value": budget}
+    if budget_strategy is not None:
+        raw["budget"] = {**raw["budget"], "strategy": budget_strategy}
     gates = dict(raw.get("gates") or {})
     if max_ece is not None:
         gates["max_ece"] = max_ece
@@ -462,6 +798,21 @@ def _run_cost_model(
             f"Invalid run overrides ({flags}) for cost model {source_label}: {problems}"
         ) from e
     return cost_model, yaml.safe_dump(raw, sort_keys=True)
+
+
+_QUEUE_FORMATS = ("csv", "parquet")
+
+
+def _run_queue_formats(queue_format: list[str] | None) -> set[str]:
+    """Validate `run --queue-format` values; repeats are harmless."""
+    formats = set(queue_format or [])
+    unknown = sorted(formats - set(_QUEUE_FORMATS))
+    if unknown:
+        raise ContractViolation(
+            f"--queue-format must be one of {', '.join(_QUEUE_FORMATS)}; got "
+            f"{', '.join(repr(u) for u in unknown)}"
+        )
+    return formats
 
 
 @app.command()
@@ -489,6 +840,11 @@ def run(
         None, help="Own-data mode, optional: labeled history to backtest (omit to skip backtest)"
     ),
     budget: float | None = typer.Option(None, help="Override budget.value of the cost model"),
+    budget_strategy: str | None = typer.Option(
+        None,
+        "--budget-strategy",
+        help="Override budget.strategy of the cost model: 'prefix' or 'fill' (money budgets only)",
+    ),
     max_ece: float | None = typer.Option(None, help="Override gates.max_ece, in (0, 1]"),
     ece_gate_mode: str | None = typer.Option(
         None,
@@ -504,6 +860,13 @@ def run(
         help="Passed to backtest (exit 5 gate). Float >= 1.0; needs a history.",
     ),
     n_random_draws: int = typer.Option(200, help="Random-baseline draws for backtest (>= 0)"),
+    queue_format: list[str] | None = typer.Option(
+        None,
+        "--queue-format",
+        help="Export the review queue from the plan stage as 'csv' or 'parquet' (repeatable) "
+        "to <run>/artifacts/review_queue.<format>, plus review_queue.json. No export by "
+        "default.",
+    ),
     fail_fast: bool = typer.Option(
         False,
         "--fail-fast",
@@ -554,6 +917,25 @@ def run(
         if path.exists() and not path.is_file():
             raise ContractViolation(f"{path} exists and is not a file; `run` needs to write it")
 
+    formats = _run_queue_formats(queue_format)
+    plan_queue_csv = layout.queue_csv if "csv" in formats else None
+    plan_queue_parquet = layout.queue_parquet if "parquet" in formats else None
+    if scenario is None:
+        assert batch is not None  # guaranteed by the mode checks above
+        plan_batch = batch
+    else:
+        assert layout.data_dir is not None
+        plan_batch = layout.data_dir / "batch.parquet"  # what the synth stage writes
+    # Same preflight, same arguments as the plan stage below receives.
+    _plan_preflight(
+        batch=plan_batch,
+        calibrator=layout.calibrator,
+        costs=layout.costs,
+        output=layout.policy,
+        queue_csv=plan_queue_csv,
+        queue_parquet=plan_queue_parquet,
+    )
+
     if scenario is not None:
         source_text, source_label = synth_module.emitted_costs_yaml(), f"scenario {scenario!r}"
     else:
@@ -564,6 +946,7 @@ def run(
         source_text,
         source_label,
         budget=budget,
+        budget_strategy=budget_strategy,
         max_ece=max_ece,
         ece_gate_mode=ece_gate_mode,
         max_residual_risk=max_residual_risk,
@@ -638,7 +1021,10 @@ def run(
         calibrator=layout.calibrator,
         costs=layout.costs,
         budget=None,  # already applied to the effective costs.yaml
+        budget_strategy=None,  # likewise
         output=layout.policy,
+        queue_csv=plan_queue_csv,
+        queue_parquet=plan_queue_parquet,
     )
     if history is not None:
         stage(
@@ -652,7 +1038,7 @@ def run(
             output=layout.backtest,
             max_budget_overrun=max_budget_overrun,
         )
-    stage("report", report, from_dir=layout.artifacts_dir, output=layout.report)
+    stage("report", report, from_dir=layout.artifacts_dir, compare_dir=None, output=layout.report)
 
     typer.echo(f"run: {' '.join(statuses)} -> {output}")
     if failures:
@@ -673,6 +1059,7 @@ def app_main() -> None:
     - ResidualRiskExceeded -> 2
     - CalibrationGateFailed -> 3
     - BudgetOverrunExceeded -> 5
+    - CandidateRegression -> 6
     - Other exceptions -> 4
     - Success -> 0
     """
@@ -690,6 +1077,9 @@ def app_main() -> None:
     except BudgetOverrunExceeded as e:
         typer.echo(f"Error: {e}", err=True)
         sys.exit(5)
+    except CandidateRegression as e:
+        typer.echo(f"Error: {e}", err=True)
+        sys.exit(6)
     except typer.Exit as e:
         sys.exit(e.exit_code)
     except ClickException as e:

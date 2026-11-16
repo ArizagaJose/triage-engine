@@ -80,6 +80,7 @@ docs/
    - `3` calibration quality below declared minimum (ECE gate)
    - `4` internal error
    - `5` replayed review count/spend above `--max-budget-overrun` (backtest)
+   - `6` candidate significantly worse (`compare --fail-on-regression`)
    Never change these meanings; add new codes only in GOAL.md first.
 4. **Domain-agnostic.** `segment` is an opaque string. No healthcare, finance,
    or any domain-specific logic anywhere. No references to any employer's work.

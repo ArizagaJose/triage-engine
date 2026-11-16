@@ -1,6 +1,7 @@
 """Determinism invariants: docs/test-spec-invariants.md A (synth, calibrate,
-plan) and D (backtest). Each pair is two runs in two processes: the shared
-session chain (in-process) and a fresh console-script process."""
+plan), D (backtest) and I.6 (fill plan). Each pair is two runs in two
+processes: the shared session chain (in-process) and a fresh console-script
+process."""
 
 from __future__ import annotations
 
@@ -288,3 +289,28 @@ def test_calibrator_policy_mismatch_exits_1(
     assert result.returncode == 1, result.stderr
     assert "hash" in result.stderr.lower()
     assert not tampered_out.exists()
+
+
+# --- I.6: a fill policy reproduces across processes ---
+
+
+def test_fill_policy_reproduces_across_processes(
+    money_demo: Any, cli_process: Any, session_tmp: Path
+) -> None:
+    out_b = session_tmp / "fill_policy_b.json"
+    ok(
+        cli_process(
+            "plan",
+            batch=money_demo.batch,
+            calibrator=money_demo.dir("fill") / "calibrator.json",
+            costs=money_demo.costs,
+            budget_strategy="fill",
+            o=out_b,
+        )
+    )
+    shared = money_demo.load("fill", "policy")
+    fresh = load_json(out_b)
+    assert canonical_dumps({k: v for k, v in fresh.items() if k != "created_at"}) == (
+        canonical_dumps({k: v for k, v in shared.items() if k != "created_at"})
+    )
+    assert fresh["policy_hash"] == content_hash(fresh) == shared["policy_hash"]

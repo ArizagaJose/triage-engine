@@ -13,13 +13,15 @@ def canonical_dumps(obj: dict[str, Any]) -> str:
 
 
 def content_hash(obj: dict[str, Any]) -> str:
-    """SHA256 hash of canonical JSON, ignoring 'created_at', 'policy_hash', and
-    'backtest_hash' at top level (popping an absent key is a no-op, so MVP hashes
-    are unchanged)."""
+    """SHA256 hash of canonical JSON, ignoring 'created_at' and the artifacts'
+    own self-hash keys ('policy_hash', 'backtest_hash', 'comparison_hash') at
+    top level. Popping an absent key is a no-op, so adding a key here never
+    changes the hash of an artifact that does not carry it."""
     obj_copy = obj.copy()
     obj_copy.pop("created_at", None)
     obj_copy.pop("policy_hash", None)
     obj_copy.pop("backtest_hash", None)
+    obj_copy.pop("comparison_hash", None)
     canonical = canonical_dumps(obj_copy)
     return hashlib.sha256(canonical.encode()).hexdigest()
 

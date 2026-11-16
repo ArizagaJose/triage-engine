@@ -1,8 +1,9 @@
 """Claim-verification invariants: docs/test-spec-invariants.md C (plan claims,
-overconfident/42), F (backtest + drift claims) and G.1-4 (capacity-sweep
-curves). Claims are recomputed in-test from the raw artifacts rather than
-trusted from the CLI's own numbers. Bounds and their measured values come
-from the spec; if one fails, report the number instead of loosening it."""
+overconfident/42), F (backtest + drift claims), G.1-4 (capacity-sweep curves)
+and I.2-5 (money-budget fill strategy). Claims are recomputed in-test from the
+raw artifacts rather than trusted from the CLI's own numbers. Bounds and their
+measured values come from the spec; if one fails, report the number instead
+of loosening it."""
 
 from __future__ import annotations
 
@@ -771,3 +772,117 @@ def test_capture_rate_at_or_above_curve_value(chains: dict[str, dict[str, Any]])
     assert capture_rate >= curve_value, (
         f"capture_rate={capture_rate}, curves.policy[10]={curve_value}"
     )
+
+
+# --- I. Money-budget fill strategy (interfaces.md §5) ------------------------------
+
+_SWEEP_BUDGETS = (100.0, 1000.0, 4000.0, 10010.0)
+
+
+def test_fill_demo_numbers_match_readme(money_demo: Any) -> None:
+    """Spec I.2: the README / risk-register R5 numbers. If one moves, update
+    those docs with it; do not loosen."""
+    prefix, fill = money_demo.load("prefix", "policy"), money_demo.load("fill", "policy")
+    assert prefix["totals"]["n_review"] == 22
+    assert round(prefix["totals"]["expected_captured_loss"], 1) == 3527.3
+    assert "allocation" not in prefix
+    assert fill["totals"]["n_review"] == 630
+    assert round(fill["totals"]["expected_captured_loss"], 1) == 7587.2
+    assert fill["totals"]["review_spend"] == 1000.0
+    assert fill["allocation"] == {"selected_candidate": "net_benefit_per_cost"}
+    realized = {
+        s: money_demo.load(s, "backtest")["strategies"]["policy"] for s in ("prefix", "fill")
+    }
+    assert realized["prefix"]["captured_loss"] == 7000.0
+    assert realized["fill"]["captured_loss"] == 7220.0
+
+
+@pytest.fixture(scope="module")
+def money_sweep(money_demo: Any) -> dict[float, dict[str, Any]]:
+    """For each sweep budget: prefix and fill policies (optimizer.plan on the
+    demo inputs) plus the per-item arrays the LP bound needs."""
+    from triage import optimizer
+
+    batch = pl.read_parquet(money_demo.batch)
+    calibrator = Calibrator.from_dict(money_demo.load("fill", "calibrator"))
+    base_model = load_costs(money_demo.costs)
+    p_error = np.asarray(calibrator.predict(batch["score"].to_numpy()), dtype=np.float64)
+    segments = batch["segment"].to_list()
+    fa = np.array([base_model.costs_for(s).false_accept_cost for s in segments])
+    rc = np.array([base_model.costs_for(s).review_cost for s in segments])
+    out: dict[float, dict[str, Any]] = {}
+    for value in _SWEEP_BUDGETS:
+        policies = {}
+        for strategy in ("prefix", "fill"):
+            budget = costs_module.Budget(type="money", value=value, strategy=strategy)
+            model = base_model.model_copy(update={"budget": budget})
+            policies[strategy] = optimizer.plan(
+                batch, calibrator, model, input_sha256s={}, tool_version="test"
+            )
+        out[value] = {"policies": policies, "net_benefit": p_error * fa - rc, "review_cost": rc}
+    return out
+
+
+def _expected_net_benefit(policy: Any) -> float:
+    return float(policy.totals["expected_captured_loss"] - policy.totals["review_spend"])
+
+
+def _lp_upper_bound(net_benefit: np.ndarray, review_cost: np.ndarray, value: float) -> float:
+    """Fractional-knapsack optimum, computed independently of the optimizer."""
+    eligible = [
+        (nb / c if c > 0 else math.inf, nb, c)
+        for nb, c in zip(net_benefit.tolist(), review_cost.tolist())
+        if nb > 0 and c <= value
+    ]
+    eligible.sort(key=lambda t: -t[0])
+    remaining, bound = value, 0.0
+    for _ratio, nb, c in eligible:
+        if c <= remaining:
+            remaining -= c
+            bound += nb
+        else:
+            bound += nb * remaining / c
+            break
+    return bound
+
+
+@pytest.mark.parametrize("value", _SWEEP_BUDGETS)
+def test_fill_never_worse_than_prefix_on_real_batch(
+    money_sweep: dict[float, dict[str, Any]], value: float
+) -> None:
+    """Spec I.3."""
+    policies = money_sweep[value]["policies"]
+    assert _expected_net_benefit(policies["fill"]) >= _expected_net_benefit(policies["prefix"])
+
+
+@pytest.mark.parametrize("value", _SWEEP_BUDGETS)
+def test_fill_within_a_tenth_of_a_percent_of_the_lp_bound(
+    money_sweep: dict[float, dict[str, Any]], value: float
+) -> None:
+    """Spec I.4: the interfaces.md §5 claim."""
+    entry = money_sweep[value]
+    bound = _lp_upper_bound(entry["net_benefit"], entry["review_cost"], value)
+    achieved = _expected_net_benefit(entry["policies"]["fill"])
+    assert achieved <= bound * (1 + 1e-12)
+    assert achieved >= 0.999 * bound, (value, achieved, bound)
+
+
+def test_fill_policy_threshold_replay(money_demo: Any) -> None:
+    """Spec I.5: planned n_review is bracketed by the strict / non-strict
+    threshold counts (ties only), and the replay reviews the non-strict count."""
+    batch = pl.read_parquet(money_demo.batch)
+    calibrator = Calibrator.from_dict(money_demo.load("fill", "calibrator"))
+    p_error = np.asarray(calibrator.predict(batch["score"].to_numpy()), dtype=np.float64)
+    segments = np.array(batch["segment"].to_list())
+    policy = money_demo.load("fill", "policy")
+    replayed = money_demo.load("fill", "backtest")["strategies"]["policy"]["segments"]
+    for seg, stats in policy["segments"].items():
+        threshold = stats["p_error_threshold"]
+        in_seg = p_error[segments == seg]
+        if threshold is None:
+            assert stats["n_review"] == 0 and replayed[seg]["n_review"] == 0
+            continue
+        above = int((in_seg > threshold).sum())
+        at_or_above = int((in_seg >= threshold).sum())
+        assert above <= stats["n_review"] <= at_or_above, seg
+        assert replayed[seg]["n_review"] == at_or_above, seg

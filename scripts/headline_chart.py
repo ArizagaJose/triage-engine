@@ -2,8 +2,8 @@
 """Generate the README headline chart: policy vs raw-confidence vs random baselines.
 
 Reproducible from a single seed. Uses the triage Python API directly
-(triage.synth / triage.calibration / triage.optimizer / triage.costs) — no CLI
-dependency, since cli.py is owned by a parallel work package.
+(triage.synth / triage.calibration / triage.optimizer / triage.costs), not the
+CLI.
 
 Usage:
     uv run python scripts/headline_chart.py --seed 42 -o docs/headline.png
@@ -29,9 +29,8 @@ from triage.calibration import CalibrationConfig, Calibrator, fit
 from triage.costs import Budget, CostModel, Gates, SegmentCosts
 from triage.optimizer import plan
 
-# Segment costs pinned by synth.py's overconfident scenario (see
-# docs/interfaces.md §6): seg_high 500/4, seg_mid 50/3, seg_low 10/2, default
-# mirrors seg_mid.
+# Segment costs as emitted by synth.py for every scenario (docs/interfaces.md
+# §6): seg_high 500/4, seg_mid 50/3, seg_low 10/2, default mirrors seg_mid.
 _SEGMENT_COSTS: dict[str, SegmentCosts] = {
     "seg_high": SegmentCosts(false_accept_cost=500.0, review_cost=4.0),
     "seg_mid": SegmentCosts(false_accept_cost=50.0, review_cost=3.0),
@@ -65,12 +64,9 @@ def _rank_by_net_benefit(
 ) -> dict[str, Any]:
     """Replicate the optimizer's ranking and compute per-item TRUE loss.
 
-    "True loss" here is the false_accept_cost incurred if an item is an
-    actual error (predicted_value != true_value) and is NOT reviewed. This is
-    the ground-truth quantity the optimizer's calibrated `expected_loss` is
-    trying to approximate; computing it directly from `true_value` is what
-    lets the headline chart claim a verifiable number rather than a modeled
-    one.
+    True loss = false_accept_cost if the item is an actual error
+    (predicted_value != true_value), else 0: the ground truth that
+    `expected_loss` approximates, so the chart's numbers are verifiable.
 
     Returns the item order under the policy's ranking (net_benefit desc,
     item_id asc tiebreak), the order under raw-confidence ranking (score

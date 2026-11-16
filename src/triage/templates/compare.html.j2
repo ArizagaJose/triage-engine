@@ -1,0 +1,204 @@
+{% extends "_base.html.j2" %}
+{% import "_macros.html.j2" as m %}
+{#- Policy comparison page (docs/interfaces.md §14.8). Same shell, CSS and
+    macros as report.html.j2; only the comparison-specific parts live here. -#}
+{% block title %}triage comparison{% endblock %}
+{% block extra_css %}  .d-better { color: var(--ok); }
+  .d-worse { color: var(--attention); }
+  .kpi .big.d-better { color: var(--ok); }
+  .kpi .big.d-worse { color: var(--attention); }
+  .kpi .ci { font-size: 0.74rem; color: var(--muted); }
+  .sides { display: table; width: 100%; table-layout: fixed; margin: 0 0 1rem; }
+  .side { display: table-cell; padding: 0.7rem 1rem; border: 1px solid var(--border); border-radius: 7px; vertical-align: top; font-size: 0.85rem; }
+  .side + .side { border-left: none; }
+  .side .name { font-weight: bold; }
+  .swatch { display: inline-block; width: 0.7rem; height: 0.7rem; border-radius: 2px; margin-right: 0.35rem; vertical-align: -1px; }
+  table.tbl tr.emphasis td { font-weight: bold; border-top: 1.5px solid #d9dde2; }
+  table.tbl td.nowrap { white-space: nowrap; }
+  .status-tag { font-size: 0.72rem; color: var(--muted); }
+{% endblock %}
+{% block page_kind %}policy comparison report{% endblock %}
+{% block verified_label %}comparison verified{% endblock %}
+{% block main_attrs %}data-status="{{ status }}" data-verdict="{{ verdict_label }}" data-basis="{{ basis.source }}"{% endblock %}
+{% macro signed(value, kind) -%}
+{%- if kind == "count" %}{{ value|fmt_signed_count }}{% elif kind == "pct" %}{{ value|fmt_signed_pts }}{% else %}{{ value|fmt_signed_cost }}{% endif -%}
+{%- endmacro %}
+{% macro plain(value, kind) -%}
+{%- if kind == "count" %}{{ value|fmt_count }}{% elif kind == "pct" %}{{ value|fmt_pct }}{% else %}{{ value|fmt_cost }}{% endif -%}
+{%- endmacro %}
+{% macro ci_range(ci, kind) -%}
+{%- if ci is none %}&mdash;{% else %}[{{ signed(ci[0], kind) }}, {{ signed(ci[1], kind) }}]{% endif -%}
+{%- endmacro %}
+{% macro seg_threshold(side) -%}
+{%- if side.status == "planned" %}P(err) &ge; {{ "%.3f"|format(side.threshold) }}{% elif side.status == "no_threshold" %}no threshold{% else %}not in plan{% endif -%}
+{%- endmacro %}
+{% block content %}
+<section id="at-a-glance">
+  {{ m.status_badge(status, status_label) }}
+  <h1>{{ headline }}</h1>
+  <p class="lede">{{ lede }}{% if ci_sentence %} {{ ci_sentence }}{% endif %}</p>
+
+  <div class="kpis">
+    {% for k in kpis %}
+    <div class="kpi" data-kpi="{{ k.id }}" data-direction="{{ k.direction }}">
+      <div class="label">{{ k.label }}</div>
+      <div class="big {% if k.direction == 'better' %}d-better{% elif k.direction == 'worse' %}d-worse{% endif %}">{{ signed(k.delta, k.kind) }}</div>
+      <div class="sub">{{ plain(k.current, k.kind) }} &rarr; {{ plain(k.candidate, k.kind) }} &middot; {{ k.direction }}</div>
+      {% if k.ci is not none %}<div class="ci">CI {{ ci_range(k.ci, k.kind) }}</div>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+
+  {{ m.checks_list(checks, severity_icon) }}
+</section>
+
+<script type="text/javascript">{{ plotly_bundle|safe }}</script>
+
+<section id="results">
+  <h2>Current vs. candidate</h2>
+  <div class="sides">
+    {% for side in ("current", "candidate") %}
+    {% set s = sides[side] %}
+    <div class="side" data-side="{{ side }}">
+      <span class="swatch" style="background: {{ s.color }}"></span><span class="name">{{ s.label }}</span><br>
+      <span class="muted">{{ s.budget_label }} &middot; planned {{ s.planned.n_review|fmt_count }} of {{ s.planned.n_total|fmt_count }} items &middot; {{ s.calibrator_method }} calibrator</span>
+    </div>
+    {% endfor %}
+  </div>
+  <div class="figure-wrap">{{ figs["fig-compare"] | safe }}</div>
+  <table class="tbl">
+    <tr><th>replayed on {{ history.n_history|fmt_count }} items</th><th>current</th><th>candidate</th><th>change</th><th>{% if uncertainty %}{{ uncertainty.ci_level|fmt_pct(0) }} CI of change{% else %}CI{% endif %}</th></tr>
+    {% for r in results %}
+    <tr{% if r.emphasis %} class="emphasis"{% endif %} data-row="{{ r.key }}">
+      <td>{{ r.label }}</td>
+      <td>{{ plain(r.current, r.kind) }}</td>
+      <td>{{ plain(r.candidate, r.kind) }}</td>
+      <td>{{ signed(r.delta, r.kind) }}</td>
+      <td>{{ ci_range(r.ci, r.kind) }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="meta">Both policies are replayed with their own calibrator on the same labeled history
+    and priced by the same cost basis (see "Evaluation cost basis" below), so the loss at stake is
+    identical: {{ history.total_true_loss|fmt_cost }} cost units from {{ history.n_errors|fmt_count }}
+    model errors. Review counts are replayed, not planned: items tying exactly at a threshold are
+    all reviewed.</p>
+</section>
+
+<section id="segments">
+  <h2>Where the difference comes from</h2>
+  <div class="figure-wrap">{{ figs["fig-compare-segments"] | safe }}</div>
+  <table class="tbl">
+    <thead><tr>
+      <th>segment</th>
+      <th title="false_accept_cost / review_cost under the evaluation basis">cost per miss / review</th>
+      <th title="items reviewed, and the calibrated p_error threshold that selects them">current reviews</th>
+      <th title="items reviewed, and the calibrated p_error threshold that selects them">candidate reviews</th>
+      <th>change in loss caught</th>
+      <th>change in reviews</th>
+      <th>change in spend</th>
+    </tr></thead>
+    <tbody>
+    {% for row in segments %}
+    <tr data-segment="{{ row.name }}">
+      <td>{{ row.name }}</td>
+      <td class="nowrap">{% if row.costs %}{{ row.costs.false_accept_cost|fmt_cost }} / {{ row.costs.review_cost|fmt_cost }}{% else %}&mdash;{% endif %}</td>
+      {% for side in ("current", "candidate") %}
+      <td class="nowrap" data-side="{{ side }}" data-status="{{ row.sides[side].status }}">{{ row.sides[side].n_review|fmt_count }} <span class="muted">of {{ row.n_total|fmt_count }}</span><br><span class="status-tag">{{ seg_threshold(row.sides[side]) }}</span></td>
+      {% endfor %}
+      <td class="nowrap">{{ row.delta.captured_loss|fmt_signed_cost }}</td>
+      <td class="nowrap">{{ row.delta.n_review|fmt_signed_count }}</td>
+      <td class="nowrap">{{ row.delta.review_spend|fmt_signed_cost }}</td>
+    </tr>
+    {% endfor %}
+    <tr class="totals">
+      <td>Total</td>
+      <td>&mdash;</td>
+      <td class="nowrap">{{ sides.current.n_review|fmt_count }} <span class="muted">of {{ history.n_history|fmt_count }}</span></td>
+      <td class="nowrap">{{ sides.candidate.n_review|fmt_count }} <span class="muted">of {{ history.n_history|fmt_count }}</span></td>
+      <td class="nowrap">{{ delta.captured_loss|fmt_signed_cost }}</td>
+      <td class="nowrap">{{ delta.n_review|fmt_signed_count }}</td>
+      <td class="nowrap">{{ delta.review_spend|fmt_signed_cost }}</td>
+    </tr>
+    </tbody>
+  </table>
+  <p class="meta">"not in plan": the segment was absent from the batch the policy was planned on, so
+    it reviews nothing there. "no threshold": the plan covered the segment but routed none of it.
+    {%- for side in ("current", "candidate") %}{% if sides[side].not_in_history %}
+    The {{ side }} policy also has thresholds for {{ sides[side].not_in_history|join(", ") }}, which this
+    history does not contain.{% endif %}{% endfor %}</p>
+</section>
+
+<section id="workload">
+  <h2>How the review queue changes</h2>
+  <table class="tbl">
+    <tr><th>items</th><th>count</th><th>loss caught</th><th>review spend</th></tr>
+    <tr data-group="both"><td>reviewed by both (kept)</td><td>{{ overlap.both.n_review|fmt_count }}</td><td>{{ overlap.both.captured_loss|fmt_cost }}</td><td>{{ overlap.both.review_spend|fmt_cost }}</td></tr>
+    <tr data-group="current_only"><td>only the current policy reviews (dropped)</td><td>{{ overlap.current_only.n_review|fmt_count }}</td><td>{{ overlap.current_only.captured_loss|fmt_cost }}</td><td>{{ overlap.current_only.review_spend|fmt_cost }}</td></tr>
+    <tr data-group="candidate_only"><td>only the candidate reviews (added)</td><td>{{ overlap.candidate_only.n_review|fmt_count }}</td><td>{{ overlap.candidate_only.captured_loss|fmt_cost }}</td><td>{{ overlap.candidate_only.review_spend|fmt_cost }}</td></tr>
+    <tr data-group="neither"><td>reviewed by neither</td><td>{{ overlap.neither.n_items|fmt_count }}</td><td>&mdash;</td><td>&mdash;</td></tr>
+  </table>
+  <p class="meta">The change in loss caught is exactly what the added items catch minus what the
+    dropped items caught: {{ overlap.candidate_only.captured_loss|fmt_cost }} &minus;
+    {{ overlap.current_only.captured_loss|fmt_cost }} = {{ delta.captured_loss|fmt_signed_cost }} cost units.
+    Reviewers would see {{ overlap.candidate_only.n_review|fmt_count }} new item(s) and stop seeing
+    {{ overlap.current_only.n_review|fmt_count }}.</p>
+</section>
+
+<section id="uncertainty">
+  <h2>How sure can we be?</h2>
+  {% if uncertainty %}
+  <table class="tbl">
+    <tr><th>change in</th><th>point estimate</th><th>{{ uncertainty.ci_level|fmt_pct(0) }} CI</th><th>reading</th></tr>
+    {% for key, label, kind in (("captured_loss", "loss caught", "cost"), ("n_review", "items reviewed", "count"), ("review_spend", "review spend", "cost")) %}
+    <tr data-row="{{ key }}">
+      <td>{{ label }}</td>
+      <td>{{ signed(delta[key], kind) }}</td>
+      <td>{{ ci_range(uncertainty.delta_ci[key], kind) }}</td>
+      <td>{{ verdict.ci.directions[key] }}</td>
+    </tr>
+    {% endfor %}
+    <tr data-row="total_cost" class="emphasis">
+      <td>total cost</td>
+      <td>{{ delta.total_cost|fmt_signed_cost }}</td>
+      <td>{{ ci_range(uncertainty.delta_ci.total_cost, "cost") }}</td>
+      <td>{{ verdict.ci.total_cost }}</td>
+    </tr>
+  </table>
+  <p class="meta">Paired bootstrap: the {{ history.n_history|fmt_count }} history items are resampled
+    with replacement {{ uncertainty.n_bootstrap|fmt_count }} times (seed {{ uncertainty.seed }}); each
+    policy keeps its own review decision per item, so only the {{ uncertainty.n_differing_items|fmt_count }}
+    item(s) the two policies treat differently move the deltas. A change counts as real when its interval
+    excludes zero. Point-estimate verdict: <b>{{ verdict.label|replace("_", " ") }}</b>; with the
+    interval: <b>{{ verdict.ci.label|replace("_", " ") }}</b>.</p>
+  {% else %}
+  <p class="note">No confidence interval: the comparison ran with <code>--n-bootstrap 0</code>. The
+    verdict (<b>{{ verdict.label|replace("_", " ") }}</b>) is a point estimate on one history.</p>
+  {% endif %}
+</section>
+
+<section id="basis">
+  <h2>Evaluation cost basis</h2>
+  <p class="meta">
+    {% if basis.source == "eval_costs" %}Both policies are priced by the explicit evaluation cost model
+    supplied with <code>--eval-costs</code>; its {{ basis.ignored_eval_costs_fields|join(" and ") }} are
+    ignored.{% else %}Both policies' own cost models agree on every segment in this history, so they
+    are compared under those shared costs.{% endif %} Budgets may differ: they are policy choices, not
+    prices. Costs are miss / review, in cost units.</p>
+  <table class="tbl">
+    <tr><th>segment</th><th>evaluation basis</th><th>current planned with</th><th>candidate planned with</th></tr>
+    {% for row in basis_rows %}
+    <tr data-segment="{{ row.name }}">
+      <td>{{ row.name }}</td>
+      <td>{{ row.basis.false_accept_cost|fmt_cost }} / {{ row.basis.review_cost|fmt_cost }}</td>
+      {% for side in ("current", "candidate") %}
+      {% set own = row[side] %}
+      <td>{% if own == "same" %}<span class="muted">same</span>{% elif own is none %}<span class="warn-text">unpriced</span>{% else %}<span class="warn-text">{{ own.false_accept_cost|fmt_cost }} / {{ own.review_cost|fmt_cost }}</span>{% endif %}</td>
+      {% endfor %}
+    </tr>
+    {% endfor %}
+  </table>
+</section>
+
+{{ m.audit_section(short_chain, hash_rows) }}
+{% endblock %}

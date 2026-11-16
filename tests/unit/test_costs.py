@@ -504,3 +504,91 @@ class TestNonFiniteValuesRejected:
         yaml_file.write_text(snippet + _YAML_SEGMENTS)
         with pytest.raises(ContractViolation, match="validation failed"):
             load(yaml_file)
+
+
+class TestBudgetStrategy:
+    """budget.strategy: "prefix" (default) | "fill" (money only), docs/interfaces.md §3."""
+
+    def test_default_is_prefix(self) -> None:
+        for budget_type in ("fraction", "count", "money"):
+            assert Budget(type=budget_type, value=0.5).strategy == "prefix"  # type: ignore[arg-type]
+
+    def test_fill_accepted_for_money(self) -> None:
+        assert Budget(type="money", value=1000.0, strategy="fill").strategy == "fill"
+
+    @pytest.mark.parametrize("budget_type", ["fraction", "count"])
+    def test_fill_rejected_for_unit_budgets(self, budget_type: str) -> None:
+        """Every review costs one unit there: fill would silently change nothing."""
+        with pytest.raises(ValueError, match="requires budget.type 'money'"):
+            Budget.model_validate({"type": budget_type, "value": 0.5, "strategy": "fill"})
+
+    @pytest.mark.parametrize("budget_type", ["fraction", "count", "money"])
+    def test_explicit_prefix_accepted_everywhere(self, budget_type: str) -> None:
+        budget = Budget.model_validate({"type": budget_type, "value": 0.5, "strategy": "prefix"})
+        assert budget.strategy == "prefix"
+
+    @pytest.mark.parametrize("strategy", ["knapsack", "FILL", "Prefix", "", None, 1, True])
+    def test_unknown_strategy_rejected(self, strategy: object) -> None:
+        with pytest.raises(ValueError):
+            Budget.model_validate({"type": "money", "value": 10.0, "strategy": strategy})
+
+    def test_dump_omits_default_strategy(self) -> None:
+        """Default-strategy snapshots stay byte-identical, so policy_hash does
+        not move for anyone who does not opt in."""
+        expected = {"type": "money", "value": 10.0}
+        assert Budget(type="money", value=10.0).model_dump() == expected
+        assert Budget(type="money", value=10.0, strategy="prefix").model_dump() == expected
+
+    def test_dump_includes_fill_and_round_trips(self) -> None:
+        budget = Budget(type="money", value=10.0, strategy="fill")
+        dumped = budget.model_dump()
+        assert dumped == {"type": "money", "value": 10.0, "strategy": "fill"}
+        assert Budget.model_validate(dumped) == budget
+
+    def test_cost_model_snapshot_carries_strategy(self) -> None:
+        model = CostModel(
+            budget=Budget(type="money", value=10.0, strategy="fill"),
+            segments={"default": SegmentCosts(false_accept_cost=1.0, review_cost=1.0)},
+        )
+        snapshot = model.model_dump()
+        assert snapshot["budget"]["strategy"] == "fill"
+        assert CostModel.model_validate(snapshot) == model
+
+    def test_existing_policy_snapshot_is_backward_compatible(self) -> None:
+        """The golden policy.json predates strategies: it validates to prefix
+        and re-dumps identically (same config_snapshot, same policy_hash)."""
+        snapshot = json.loads(_GOLDEN_POLICY.read_text())["config_snapshot"]
+        assert "strategy" not in snapshot["budget"]
+        model = CostModel.model_validate(snapshot)
+        assert model.budget.strategy == "prefix"
+        assert model.model_dump() == snapshot
+
+    def test_load_yaml_with_fill(self, tmp_path: Path) -> None:
+        yaml_file = tmp_path / "fill.yaml"
+        yaml_file.write_text(
+            "budget:\n  type: money\n  value: 1000\n  strategy: fill\n" + _YAML_SEGMENTS
+        )
+        model = load(yaml_file)
+        assert model.budget.strategy == "fill"
+        assert model.budget.value == 1000.0
+
+    @pytest.mark.parametrize(
+        ("budget_yaml", "expected"),
+        [
+            ("  type: fraction\n  value: 0.1\n  strategy: fill\n", "requires budget.type 'money'"),
+            ("  type: money\n  value: 10\n  strategy: knapsack\n", "strategy"),
+            ("  type: money\n  value: 10\n  strategy: null\n", "strategy"),
+            ("  type: money\n  value: 10\n  stratgy: fill\n", "stratgy"),  # typo'd key
+        ],
+    )
+    def test_load_yaml_invalid_strategy_is_contract_violation(
+        self, tmp_path: Path, budget_yaml: str, expected: str
+    ) -> None:
+        yaml_file = tmp_path / "bad_strategy.yaml"
+        yaml_file.write_text("budget:\n" + budget_yaml + _YAML_SEGMENTS)
+        with pytest.raises(ContractViolation) as exc_info:
+            load(yaml_file)
+        message = str(exc_info.value)
+        assert "validation" in message.lower()
+        assert expected in message
+        assert str(yaml_file) in message

@@ -51,11 +51,8 @@ class Calibrator:
             x_thresholds = np.asarray(self.params["x_thresholds"], dtype=np.float64)
             y_thresholds = np.asarray(self.params["y_thresholds"], dtype=np.float64)
             if x_thresholds.size == 1:
-                # Degenerate single-threshold case: np.interp requires at
-                # least 2 points with strictly increasing x for a real
-                # interpolation; with a single point every input maps to
-                # that point's y, which is exactly out_of_bounds="clip"
-                # behavior (nothing to interpolate between).
+                # Degenerate constant fit: every score maps to the single y
+                # (what np.interp would also return; kept explicit).
                 return np.full_like(scores, y_thresholds[0], dtype=np.float64)
             interpolated: np.ndarray = np.interp(scores, x_thresholds, y_thresholds)
             return interpolated
@@ -198,11 +195,8 @@ def _split_indices(
     """Stable sort by item_id, then permute with default_rng(seed); the last
     `holdout_fraction` of the permuted order is the holdout.
 
-    Rounding convention: n_holdout = round(holdout_fraction * n), using
-    Python/NumPy banker's rounding (round-half-to-even) on the float
-    product. This is the natural, unambiguous choice given a single pinned
-    formula in interfaces.md; it is deterministic and symmetric, unlike
-    floor/ceil which would systematically bias holdout size up or down.
+    n_holdout = round(holdout_fraction * n), Python's round-half-to-even
+    (no systematic bias up or down, unlike floor/ceil).
     """
     n = len(item_ids)
     order = np.argsort(np.asarray(item_ids), kind="stable")

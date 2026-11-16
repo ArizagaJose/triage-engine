@@ -8,16 +8,25 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import polars as pl
 import pytest
+from rich.text import Text
+from typer import rich_utils
 
 from tests.support import (
+    assert_queue_reconciles,
+    files_under,
     gates_row_cells,
     load_json,
     ok,
+    read_queue_csv,
+    tree_digest,
     without_created_at,
     write_costs,
+    write_money_costs,
 )
-from triage.artifacts import content_hash
+from triage.artifacts import content_hash, file_sha256
+from triage.review_queue import queue_hash
 
 
 @pytest.fixture(scope="module")
@@ -304,6 +313,189 @@ def test_plan_invalid_gate_mode_yaml_exit_1(
     assert not out.exists()
 
 
+# --- plan: review queue export (--queue-csv / --queue-parquet) --------------------
+
+QUEUE_CSV, QUEUE_PARQUET, QUEUE_MANIFEST = (
+    "review_queue.csv",
+    "review_queue.parquet",
+    "review_queue.json",
+)
+
+
+def test_plan_queue_export_both_formats(cli: Any, base: Any, tmp_path: Path) -> None:
+    out, qdir = tmp_path / "policy.json", tmp_path / "not" / "yet" / "created"
+    result = ok(
+        _plan(cli, base, out, queue_csv=qdir / QUEUE_CSV, queue_parquet=qdir / QUEUE_PARQUET)
+    )
+    manifest_path = qdir / QUEUE_MANIFEST
+    assert result.stdout.rstrip().endswith(f"-> {out} queue=1000 rows -> {manifest_path}")
+
+    policy = load_json(out)
+    # Exporting changes nothing in policy.json: same content as the chain's plan.
+    assert without_created_at(policy) == without_created_at(base.load("policy"))
+
+    manifest = load_json(manifest_path)
+    assert manifest["created_at"] == policy["created_at"]  # one timestamp per plan
+    assert manifest["policy_hash"] == policy["policy_hash"] == content_hash(policy)
+    assert manifest["input_sha256s"] == policy["input_sha256s"]
+    assert manifest["gates"] == {"status": "pass", "failed": []}
+    assert manifest["files"] == {
+        "csv": {"path": QUEUE_CSV, "sha256": file_sha256(qdir / QUEUE_CSV)},
+        "parquet": {"path": QUEUE_PARQUET, "sha256": file_sha256(qdir / QUEUE_PARQUET)},
+    }
+
+    from_csv = read_queue_csv(qdir / QUEUE_CSV)
+    from_parquet = pl.read_parquet(qdir / QUEUE_PARQUET)
+    assert from_csv.equals(from_parquet)
+    assert manifest["queue_hash"] == queue_hash(from_csv) == queue_hash(from_parquet)
+    assert manifest["n_rows"] == from_csv.height == 1000
+    assert_queue_reconciles(from_csv, policy)
+
+
+@pytest.mark.parametrize("fmt", ["csv", "parquet"])
+def test_plan_queue_single_format(cli: Any, base: Any, tmp_path: Path, fmt: str) -> None:
+    name = QUEUE_CSV if fmt == "csv" else QUEUE_PARQUET
+    ok(_plan(cli, base, tmp_path / "policy.json", **{f"queue_{fmt}": tmp_path / name}))
+    assert files_under(tmp_path) == {"policy.json", name, QUEUE_MANIFEST}
+    assert set(load_json(tmp_path / QUEUE_MANIFEST)["files"]) == {fmt}
+
+
+def test_plan_queue_suffix_is_case_insensitive(cli: Any, base: Any, tmp_path: Path) -> None:
+    ok(
+        _plan(
+            cli,
+            base,
+            tmp_path / "policy.json",
+            queue_csv=tmp_path / "Q.CSV",
+            queue_parquet=tmp_path / "Q.Parquet",
+        )
+    )
+    assert set(load_json(tmp_path / QUEUE_MANIFEST)["files"]) == {"csv", "parquet"}
+
+
+def test_plan_without_queue_writes_only_the_policy(cli: Any, base: Any, tmp_path: Path) -> None:
+    result = ok(_plan(cli, base, tmp_path / "policy.json"))
+    assert files_under(tmp_path) == {"policy.json"}
+    assert "queue=" not in result.stdout
+
+
+# Gate outcomes (seed-42 overconfident: ece_holdout 0.0463 passes max_ece 0.05,
+# ece_ci[1] 0.0820 fails it; expected residual ~145225).
+@pytest.mark.parametrize(
+    ("gates", "code", "failed"),
+    [
+        ({}, 0, []),
+        ({"max_ece": None}, 0, []),
+        ({"max_residual_risk": 1e9}, 0, []),
+        ({"ece_gate_mode": "ci_upper"}, 3, ["max_ece"]),
+        ({"max_residual_risk": 1000.0}, 2, ["max_residual_risk"]),
+        # Both fail: BOTH are recorded (new), exit code is still the first
+        # check's (max_ece -> 3), exactly as before the queue existed.
+        (
+            {"ece_gate_mode": "ci_upper", "max_residual_risk": 1000.0},
+            3,
+            ["max_ece", "max_residual_risk"],
+        ),
+    ],
+    ids=["default", "no-gates", "residual-pass", "ece-fail", "residual-fail", "both-fail"],
+)
+def test_plan_queue_records_gate_outcome(
+    cli: Any, base: Any, tmp_path: Path, gates: dict[str, Any], code: int, failed: list[str]
+) -> None:
+    costs = write_costs(base.costs, tmp_path / "costs.yaml", **gates)
+    plain = _plan(cli, base, tmp_path / "plain" / "policy.json", costs=costs)
+    out, queue = tmp_path / "exported" / "policy.json", tmp_path / "exported" / QUEUE_CSV
+    exported = _plan(cli, base, out, costs=costs, queue_csv=queue)
+
+    # Exit code, messages and policy.json are those of a plan without export.
+    assert plain.returncode == exported.returncode == code, exported.stderr
+    assert plain.stderr == exported.stderr
+    assert without_created_at(load_json(out)) == without_created_at(
+        load_json(tmp_path / "plain" / "policy.json")
+    )
+    # Artifact-first: the queue and its manifest exist even on a failed gate,
+    # and the manifest says so (a consumer must refuse a failed-gate queue).
+    manifest = load_json(out.parent / QUEUE_MANIFEST)
+    assert manifest["gates"] == {"status": "failed" if failed else "pass", "failed": failed}
+    assert (manifest["gates"]["status"] == "pass") == (exported.returncode == 0)
+    assert_queue_reconciles(read_queue_csv(queue), load_json(out))
+
+
+def test_plan_queue_gate_contract_violation_still_exit_1(
+    cli: Any, base: Any, tmp_path: Path
+) -> None:
+    """A ContractViolation from a gate check is not a gate outcome: it still
+    propagates (exit 1) and is never recorded as a failed gate."""
+    costs = write_costs(base.costs, tmp_path / "costs.yaml", ece_gate_mode="upper")
+    result = _plan(cli, base, tmp_path / "policy.json", costs=costs, queue_csv=tmp_path / "q.csv")
+    assert result.returncode == 1
+    assert files_under(tmp_path) == {"costs.yaml"}
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        ({"queue_csv": "q.txt"}, "--queue-csv {t}/q.txt must end in .csv"),
+        ({"queue_parquet": "q.csv"}, "--queue-parquet {t}/q.csv must end in .parquet"),
+        ({"queue_csv": "q.parquet"}, "must end in .csv"),
+        (
+            {"queue_csv": "a/q.csv", "queue_parquet": "b/q.parquet"},
+            "must be in the same directory",
+        ),
+        ({"queue_parquet": "<batch>"}, "would overwrite --batch"),
+        ({"queue_csv": "q.csv", "o": "review_queue.json"}, "would overwrite --output"),
+        ({"queue_csv": "q.csv", "calibrator": "review_queue.json"}, "would overwrite --calibrator"),
+        ({"queue_csv": "isdir.csv"}, "--queue-csv {t}/isdir.csv exists and is not a file"),
+        ({"queue_parquet": "manifest_dir/q.parquet"}, "exists and is not a file"),
+    ],
+    ids=[
+        "csv-suffix",
+        "parquet-suffix",
+        "csv-given-parquet-name",
+        "different-dirs",
+        "overwrites-batch",
+        "manifest-overwrites-output",
+        "manifest-overwrites-calibrator",
+        "csv-is-a-directory",
+        "manifest-is-a-directory",
+    ],
+)
+def test_plan_queue_invalid_options_exit_1_before_writing(
+    cli: Any, base: Any, tmp_path: Path, options: dict[str, str], expected: str
+) -> None:
+    (tmp_path / "isdir.csv").mkdir()
+    (tmp_path / "manifest_dir" / QUEUE_MANIFEST).mkdir(parents=True)
+    calibrator_copy = tmp_path / QUEUE_MANIFEST
+    calibrator_copy.write_bytes(base.calibrator.read_bytes())
+    before = tree_digest(tmp_path)
+
+    resolved = {
+        key: base.batch if value == "<batch>" else tmp_path / value
+        for key, value in options.items()
+    }
+    resolved.setdefault("o", tmp_path / "policy.json")
+    result = cli(
+        "plan",
+        batch=base.batch,
+        calibrator=resolved.pop("calibrator", base.calibrator),
+        costs=base.costs,
+        **resolved,
+    )
+    assert result.returncode == 1, result.stderr
+    assert expected.format(t=tmp_path) in result.stderr
+    assert tree_digest(tmp_path) == before  # nothing written, nothing overwritten
+
+
+@pytest.mark.parametrize("force_terminal", [False, True])
+def test_plan_help_lists_queue_options(
+    cli: Any, monkeypatch: pytest.MonkeyPatch, force_terminal: bool
+) -> None:
+    monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", force_terminal)
+    help_text = Text.from_ansi(ok(cli.argv(["plan", "--help"])).stdout).plain
+    for flag in ("--queue-csv", "--queue-parquet"):
+        assert flag in help_text
+
+
 # --- backtest --------------------------------------------------------------------
 
 
@@ -375,3 +567,96 @@ def test_ci_upper_policy_backtests_and_reports_checked_upper_bound(
         f"{ece_numbers[1]:.3f}",
         "FAIL",
     ]
+
+
+# --- plan --budget-strategy (money budgets, docs/interfaces.md §5 / §8) ------------
+
+
+def test_plan_budget_strategy_fill_records_strategy_and_candidate(
+    cli: Any, base: Any, tmp_path: Path
+) -> None:
+    costs = write_money_costs(base.costs, tmp_path / "money.yaml")
+    out = tmp_path / "policy.json"
+    result = ok(_plan(cli, base, out, costs=costs, budget_strategy="fill"))
+    policy = load_json(out)
+    candidate = policy["allocation"]["selected_candidate"]
+    assert f"budget_strategy=fill selected_candidate={candidate} policy_hash=" in result.stdout
+    assert policy["budget"] == {"type": "money", "value": 1000.0, "strategy": "fill"}
+    assert policy["config_snapshot"]["budget"] == policy["budget"]
+    assert policy["policy_hash"] == content_hash(policy)
+
+
+def test_plan_default_strategy_summary_and_artifact_unchanged(
+    cli: Any, base: Any, tmp_path: Path
+) -> None:
+    costs = write_money_costs(base.costs, tmp_path / "money.yaml")
+    out = tmp_path / "policy.json"
+    result = ok(_plan(cli, base, out, costs=costs))
+    assert "budget_strategy" not in result.stdout
+    policy = load_json(out)
+    assert "allocation" not in policy
+    assert policy["budget"] == {"type": "money", "value": 1000.0}
+    assert "strategy" not in policy["config_snapshot"]["budget"]
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected"),
+    [
+        ("fill", "requires budget.type 'money'"),  # the emitted costs use a fraction budget
+        ("knapsack", "Input should be 'prefix' or 'fill'"),
+    ],
+)
+def test_plan_invalid_budget_strategy_exit_1_nothing_written(
+    cli: Any, base: Any, tmp_path: Path, strategy: str, expected: str
+) -> None:
+    out = tmp_path / "policy.json"
+    result = _plan(cli, base, out, budget_strategy=strategy)
+    assert result.returncode == 1, result.stderr
+    assert f"--budget-strategy override {strategy!r}" in result.stderr
+    assert expected in result.stderr
+    assert not out.exists()
+
+
+def test_plan_budget_override_keeps_yaml_fill(cli: Any, base: Any, tmp_path: Path) -> None:
+    costs = write_money_costs(base.costs, tmp_path / "money.yaml", strategy="fill")
+    out = tmp_path / "policy.json"
+    ok(_plan(cli, base, out, costs=costs, budget=500))
+    assert load_json(out)["budget"] == {"type": "money", "value": 500.0, "strategy": "fill"}
+
+
+def test_plan_budget_strategy_prefix_switches_yaml_fill_off(
+    cli: Any, base: Any, tmp_path: Path
+) -> None:
+    fill_yaml = write_money_costs(base.costs, tmp_path / "fill.yaml", strategy="fill")
+    plain_yaml = write_money_costs(base.costs, tmp_path / "plain.yaml")
+    ok(_plan(cli, base, tmp_path / "a.json", costs=fill_yaml, budget_strategy="prefix"))
+    ok(_plan(cli, base, tmp_path / "b.json", costs=plain_yaml))
+    switched, plain = load_json(tmp_path / "a.json"), load_json(tmp_path / "b.json")
+    assert "allocation" not in switched
+    for key in ("budget", "config_snapshot", "segments", "totals"):
+        assert switched[key] == plain[key], key
+
+
+def test_plan_combined_invalid_overrides_name_both_flags(
+    cli: Any, base: Any, tmp_path: Path
+) -> None:
+    result = _plan(cli, base, tmp_path / "p.json", budget=0.2, budget_strategy="fill")
+    assert result.returncode == 1
+    assert "--budget override 0.2 and --budget-strategy override 'fill'" in result.stderr
+
+
+# --- a fill policy downstream: backtest and report ----------------------------------
+
+
+def test_fill_policy_backtests_and_reports_strategy(
+    cli: Any, money_demo: Any, tmp_path: Path
+) -> None:
+    fill_dir = money_demo.dir("fill")
+    backtest = money_demo.load("fill", "backtest")
+    assert backtest["input_sha256s"]["policy"] == money_demo.load("fill", "policy")["policy_hash"]
+
+    report = tmp_path / "report.html"
+    ok(cli("report", **{"from": fill_dir}, o=report))
+    assert "budget 1,000 cost units (fill strategy, net-benefit-per-cost ranking)" in (
+        report.read_text()
+    )
